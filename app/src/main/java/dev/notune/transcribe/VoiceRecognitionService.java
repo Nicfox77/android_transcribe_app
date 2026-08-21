@@ -10,26 +10,29 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import android.speech.RecognitionService;
+import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.util.Log;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 
 /**
  * Exposes the offline transcriber as a system speech-to-text provider via
  * {@link android.speech.RecognitionService}.
  *
- * <p>For microphone recognition Android expects a RecognitionService to create
- * a caller-attribution context inside {@link #onStartListening(Intent, Callback)}
- * and open the microphone through that context. This is important for IME callers:
- * Android checks the keyboard's RECORD_AUDIO identity and records this service as
- * a proxy. The previous native/cpal capture did not create that attribution chain,
- * which caused ERROR_INSUFFICIENT_PERMISSIONS on modern Android/GrapheneOS.
+ * <p>Preferred Android 13+ path: callers can provide an already-open PCM stream in
+ * {@link RecognizerIntent#EXTRA_AUDIO_SOURCE}. In that mode the caller owns microphone
+ * permission/AppOps and this background service only consumes PCM and runs inference.
+ * This is ideal for an active IME such as HeliBoard.
  *
- * <p>AudioRecord captures 16 kHz mono PCM16 here and forwards small chunks to the
- * existing Rust endpoint/VAD/Parakeet streaming worker. Model inference remains native.
+ * <p>Fallback path: for callers that do not provide audio, the service creates the
+ * documented caller-attribution context and opens an attributed AudioRecord itself.
+ * Both paths feed the same Rust endpoint/VAD/Parakeet streaming worker.
  */
 public class VoiceRecognitionService extends RecognitionService {
 
@@ -49,6 +52,7 @@ public class VoiceRecognitionService extends RecognitionService {
     private Callback mCallback;
     private volatile boolean mRecording;
     private AudioRecord mAudioRecord;
+    private InputStream mInjectedInput;
     private Thread mAudioThread;
 
     @Override
@@ -66,9 +70,8 @@ public class VoiceRecognitionService extends RecognitionService {
         mCallback = callback;
 
         try {
-            // RecognitionService.createContext() notices this caller attribution
-            // synchronously on its handler thread. That is also what Android's
-            // permission bookkeeping expects before onStartListening returns.
+            // Keep the documented attribution chain for the fallback microphone path
+            // and for RecognitionService's permission bookkeeping on modern Android.
             Context recordingContext = this;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 recordingContext = createContext(
@@ -77,10 +80,15 @@ public class VoiceRecognitionService extends RecognitionService {
                                 .build());
             }
 
-            // Create the native streaming/VAD session first. Java then owns the
-            // attributed microphone and forwards PCM to that worker.
+            // Create the native streaming/VAD session before audio starts arriving.
             startListening(this);
-            startAudioCapture(recordingContext);
+
+            ParcelFileDescriptor injectedSource = getInjectedAudioSource(recognizerIntent);
+            if (injectedSource != null) {
+                startInjectedAudio(recognizerIntent, injectedSource);
+            } else {
+                startAudioCapture(recordingContext);
+            }
         } catch (Throwable t) {
             Log.e(TAG, "startListening failed", t);
             stopAudioCapture();
@@ -94,7 +102,7 @@ public class VoiceRecognitionService extends RecognitionService {
 
     @Override
     protected void onStopListening(Callback callback) {
-        // Stop capture before sending Finish so no later PCM can race finalization.
+        // Stop the producer before sending Finish so no later PCM can race finalization.
         stopAudioCapture();
         try {
             stopListening();
@@ -124,6 +132,129 @@ public class VoiceRecognitionService extends RecognitionService {
         super.onDestroy();
     }
 
+    private ParcelFileDescriptor getInjectedAudioSource(Intent intent) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return null;
+        }
+        return intent.getParcelableExtra(
+                RecognizerIntent.EXTRA_AUDIO_SOURCE,
+                ParcelFileDescriptor.class);
+    }
+
+    /** Consume PCM supplied by the SpeechRecognizer caller instead of opening our mic. */
+    private void startInjectedAudio(Intent intent, ParcelFileDescriptor source) {
+        stopAudioCapture();
+
+        int sampleRate = intent.getIntExtra(
+                RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE,
+                SAMPLE_RATE);
+        int channelCount = intent.getIntExtra(
+                RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT,
+                1);
+        int encoding = intent.getIntExtra(
+                RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING,
+                AudioFormat.ENCODING_PCM_16BIT);
+
+        if (sampleRate != SAMPLE_RATE
+                || channelCount != 1
+                || encoding != AudioFormat.ENCODING_PCM_16BIT) {
+            try {
+                source.close();
+            } catch (IOException ignored) {
+            }
+            throw new IllegalArgumentException(
+                    "Unsupported injected audio: " + sampleRate + " Hz, channels="
+                            + channelCount + ", encoding=" + encoding);
+        }
+
+        ParcelFileDescriptor.AutoCloseInputStream input =
+                new ParcelFileDescriptor.AutoCloseInputStream(source);
+        mInjectedInput = input;
+        mRecording = true;
+
+        onReadyForSpeech();
+        Log.i(TAG, "Using caller-provided PCM audio source for recognition");
+
+        mAudioThread = new Thread(() -> readInjectedAudio(input),
+                "offline-voice-injected-audio");
+        mAudioThread.start();
+    }
+
+    /** Read little-endian PCM16 from EXTRA_AUDIO_SOURCE and feed the native stream. */
+    private void readInjectedAudio(InputStream input) {
+        byte[] bytes = new byte[2048];
+        short[] samples = new short[1024];
+        int carry = -1;
+        boolean reachedEof = false;
+
+        try {
+            while (mRecording) {
+                int count = input.read(bytes);
+                if (count < 0) {
+                    reachedEof = true;
+                    break;
+                }
+                if (count == 0) {
+                    continue;
+                }
+
+                int src = 0;
+                int dst = 0;
+
+                if (carry >= 0) {
+                    int hi = bytes[src++] & 0xff;
+                    samples[dst++] = (short) (carry | (hi << 8));
+                    carry = -1;
+                }
+
+                while (src + 1 < count) {
+                    int lo = bytes[src++] & 0xff;
+                    int hi = bytes[src++] & 0xff;
+                    samples[dst++] = (short) (lo | (hi << 8));
+                }
+
+                if (src < count) {
+                    carry = bytes[src] & 0xff;
+                }
+
+                if (dst > 0) {
+                    feedAudio(samples, dst);
+                }
+            }
+        } catch (IOException e) {
+            if (mRecording) {
+                Log.w(TAG, "Injected audio source ended with I/O error", e);
+            }
+        } catch (Throwable t) {
+            if (mRecording) {
+                Log.e(TAG, "Injected audio feed failed", t);
+                mainHandler.post(() -> onError(SpeechRecognizer.ERROR_CLIENT));
+            }
+            return;
+        } finally {
+            try {
+                input.close();
+            } catch (IOException ignored) {
+            }
+        }
+
+        // EXTRA_AUDIO_SOURCE is defined to end when the caller closes its audio.
+        // If Rust did not already endpoint, treat clean EOF as an explicit stop.
+        if (reachedEof && mRecording) {
+            mRecording = false;
+            mainHandler.post(() -> {
+                Log.i(TAG, "Caller audio source closed; finalizing recognition");
+                try {
+                    stopListening();
+                } catch (Throwable t) {
+                    Log.e(TAG, "finalize after injected EOF failed", t);
+                    safeError(SpeechRecognizer.ERROR_CLIENT);
+                }
+            });
+        }
+    }
+
+    /** Fallback for SpeechRecognizer callers that do not supply EXTRA_AUDIO_SOURCE. */
     private void startAudioCapture(Context recordingContext) {
         stopAudioCapture();
 
@@ -131,8 +262,6 @@ public class VoiceRecognitionService extends RecognitionService {
                 SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT);
-        // Give AudioRecord roughly one second of internal buffering while JNI/model
-        // processing runs on separate threads. Reads themselves remain small/low-latency.
         int bufferBytes = Math.max(minBytes > 0 ? minBytes : 0, SAMPLE_RATE * 2);
 
         AudioRecord.Builder builder = new AudioRecord.Builder()
@@ -166,8 +295,6 @@ public class VoiceRecognitionService extends RecognitionService {
         Log.i(TAG, "Attributed AudioRecord started for recognition");
 
         mAudioThread = new Thread(() -> {
-            // 1024 samples ~= 64 ms at 16 kHz: small enough for responsive VAD and
-            // partial streaming without putting inference on the audio thread.
             short[] buffer = new short[1024];
             while (mRecording) {
                 AudioRecord current = mAudioRecord;
@@ -205,6 +332,15 @@ public class VoiceRecognitionService extends RecognitionService {
             try {
                 recorder.release();
             } catch (Throwable ignored) {
+            }
+        }
+
+        InputStream injected = mInjectedInput;
+        mInjectedInput = null;
+        if (injected != null) {
+            try {
+                injected.close();
+            } catch (IOException ignored) {
             }
         }
 
@@ -255,8 +391,7 @@ public class VoiceRecognitionService extends RecognitionService {
     }
 
     public void onEndOfSpeech() {
-        // Auto-endpointing originates in Rust. Close the recorder immediately so
-        // no more samples can arrive while the stream is being finalized.
+        // Auto-endpointing originates in Rust. Close whichever audio source is active.
         stopAudioCapture();
         mainHandler.post(() -> {
             Callback cb = mCallback;
