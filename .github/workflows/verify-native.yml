@@ -37,6 +37,107 @@ jobs:
           sudo apt-get install -y cmake ninja-build
           cargo install cargo-ndk
 
+      # Experimental phone-test patch. Keep the source branch's proven final-only
+      # path untouched until this is exercised on-device. Unified's stream exposes
+      # its revisable tentative hypothesis during feed; forward it through Android
+      # partialResults so HeliBoard can render it as composing text.
+      - name: Enable experimental streaming partial results
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          engine = Path('src/engine.rs')
+          s = engine.read_text()
+          old = '''                    let t = std::time::Instant::now();
+                    if let Err(e) = stream.feed(&chunk) {
+                        compute += t.elapsed();
+                        log::error!(
+                            "buffered stream feed failed after {:.1}s audio: {}; falling back to batch",
+                            fallback_audio.len() as f64 / 16_000.0,
+                            e
+                        );
+                        stream.reset();
+                        drop(stream);
+                        return self.transcribe_channel_batch(receiver, fallback_audio);
+                    }
+                    compute += t.elapsed();
+'''
+          new = '''                    let t = std::time::Instant::now();
+                    let update = match stream.feed(&chunk) {
+                        Ok(update) => update,
+                        Err(e) => {
+                            compute += t.elapsed();
+                            log::error!(
+                                "buffered stream feed failed after {:.1}s audio: {}; falling back to batch",
+                                fallback_audio.len() as f64 / 16_000.0,
+                                e
+                            );
+                            stream.reset();
+                            drop(stream);
+                            return self.transcribe_channel_batch(receiver, fallback_audio);
+                        }
+                    };
+                    compute += t.elapsed();
+
+                    if update.result_changed {
+                        let partial = stream.text().display();
+                        if !partial.trim().is_empty() {
+                            crate::recog_service::emit_partial(&partial);
+                        }
+                    }
+'''
+          if old not in s:
+              raise SystemExit('engine streaming feed marker not found')
+          engine.write_text(s.replace(old, new, 1))
+
+          recog = Path('src/recog_service.rs')
+          s = recog.read_text()
+          marker = '''fn call_error(env: &mut JNIEnv, obj: &JObject, code: i32) {
+    let _ = env.call_method(obj, "onError", "(I)V", &[code.into()]);
+}
+
+fn call_results(env: &mut JNIEnv, obj: &JObject, text: &str) {
+'''
+          replacement = '''fn call_error(env: &mut JNIEnv, obj: &JObject, code: i32) {
+    let _ = env.call_method(obj, "onError", "(I)V", &[code.into()]);
+}
+
+pub(crate) fn emit_partial(text: &str) {
+    let target = {
+        let guard = SESSION.lock().unwrap();
+        let Some(session) = guard.as_ref() else {
+            return;
+        };
+        if session.shared.cancelled.load(Ordering::SeqCst)
+            || session.shared.finalized.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        (session.shared.jvm.clone(), session.shared.target.clone())
+    };
+
+    let (jvm, target) = target;
+    let Ok(mut env) = jvm.attach_current_thread() else {
+        return;
+    };
+    let Ok(jtxt) = env.new_string(text) else {
+        return;
+    };
+    let _ = env.call_method(
+        target.as_obj(),
+        "onPartialResults",
+        "(Ljava/lang/String;)V",
+        &[(&jtxt).into()],
+    );
+}
+
+fn call_results(env: &mut JNIEnv, obj: &JObject, text: &str) {
+'''
+          if marker not in s:
+              raise SystemExit('RecognitionService callback marker not found')
+          recog.write_text(s.replace(marker, replacement, 1))
+          PY
+
       - name: Compile Rust and transcribe.cpp for Android
         env:
           TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
@@ -83,7 +184,7 @@ jobs:
           s = s.replace('<string name="models_builtin">Parakeet TDT 0.6B v3</string>',
                         '<string name="models_builtin">Parakeet Unified EN 0.6B Q4</string>')
           s = s.replace('<string name="models_builtin_sub">Included in the app · 25 European languages</string>',
-                        '<string name="models_builtin_sub">Included in this test build · English · streaming</string>')
+                        '<string name="models_builtin_sub">Included in this test build · English · streaming partials</string>')
           strings.write_text(s)
 
           assets = Path('src/assets.rs')
@@ -99,7 +200,7 @@ jobs:
       - name: Upload Unified Q4 test APK
         uses: actions/upload-artifact@v4
         with:
-          name: offline-voice-input-unified-q4-streaming
+          name: offline-voice-input-unified-q4-streaming-partials
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           compression-level: 0
@@ -108,11 +209,11 @@ jobs:
   heliboard-inline-client:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout HeliBoard inline voice branch
+      - name: Checkout latest HeliBoard inline voice integration
         uses: actions/checkout@v4
         with:
           repository: Nicfox77/HeliBoard
-          ref: feature/parakeet-inline-voice
+          ref: b958d33a696b4ec22e4316e865416aae10537eb1
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -121,6 +222,19 @@ jobs:
           distribution: temurin
 
       - uses: gradle/actions/setup-gradle@v3
+
+      - name: Limit test APK to arm64
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/build.gradle.kts')
+          s = p.read_text()
+          old = 'abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))'
+          new = 'abiFilters.add("arm64-v8a")'
+          if old not in s:
+              raise SystemExit('expected abiFilters declaration not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -131,7 +245,7 @@ jobs:
       - name: Upload HeliBoard inline voice APK
         uses: actions/upload-artifact@v4
         with:
-          name: HeliBoard-inline-voice-debug
+          name: HeliBoard-inline-voice-arm64
           path: app/build/outputs/apk/debug/*-debug*.apk
           if-no-files-found: error
           retention-days: 14
