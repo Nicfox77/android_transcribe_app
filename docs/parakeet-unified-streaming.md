@@ -26,6 +26,8 @@ The RecognitionService uses the 1.12-second Parakeet Unified profile:
 
 Audio is fed to the model continuously while the microphone is active, but Android receives only the final stable transcript. This is meant to remove most of the post-recording wait without showing changing partial text while dictating.
 
+Parakeet Unified currently uses buffered streaming, so the left context is recomputed as the stream advances. That makes on-device real-time factor the key feasibility measurement: streaming only removes the final wait if the phone can sustain an RTF below 1.0 over a normal dictation session.
+
 ## SwiftKey
 
 Select this app as Android's speech-recognition provider. In SwiftKey, disable **Multi-modal voice typing** if SwiftKey otherwise forces its own voice provider. Tapping the microphone can then invoke the system `RecognitionService` while SwiftKey remains the active keyboard.
