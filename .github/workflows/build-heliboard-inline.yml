@@ -12,7 +12,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Nicfox77/HeliBoard
-          ref: b958d33a696b4ec22e4316e865416aae10537eb1
+          ref: b7177000708da2f87e313315bd2939cfe64e897c
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -44,7 +44,7 @@ jobs:
       - name: Upload HeliBoard inline voice APK
         uses: actions/upload-artifact@v4
         with:
-          name: HeliBoard-inline-voice-arm64
+          name: HeliBoard-inline-voice-diagnostic-arm64
           path: app/build/outputs/apk/debug/*-debug*.apk
           if-no-files-found: error
           retention-days: 14
