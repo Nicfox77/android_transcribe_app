@@ -12,7 +12,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Nicfox77/HeliBoard
-          ref: feature/parakeet-inline-voice
+          ref: b958d33a696b4ec22e4316e865416aae10537eb1
 
       - name: Set up JDK
         uses: actions/setup-java@v4
