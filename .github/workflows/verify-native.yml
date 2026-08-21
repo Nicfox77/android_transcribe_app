@@ -1,0 +1,37 @@
+name: Verify native Android build
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "ndk;28.0.13004108"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          cargo install cargo-ndk
+
+      - name: Compile Rust and transcribe.cpp for Android
+        env:
+          TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+        run: cargo ndk -t arm64-v8a build --release
