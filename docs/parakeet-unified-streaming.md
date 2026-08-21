@@ -11,9 +11,18 @@ Use `handy-computer/parakeet-unified-en-0.6b-gguf` with:
 - SHA-256: `a8bf3de2b393bd14ead5a858c3748d5e3b07a20fdeabdd3b498fba4f463fa929`
 - Download: `https://huggingface.co/handy-computer/parakeet-unified-en-0.6b-gguf/resolve/main/parakeet-unified-en-0.6b-Q4_K_M.gguf`
 
-Download the GGUF on Android, open **Models** in Offline Voice Input, import it, and select it as the active model.
+For the normal app build, download the GGUF on Android, open **Models** in Offline Voice Input, import it, and select it as the active model. The normal build keeps Parakeet TDT v3 bundled, and non-streaming models continue to use the existing batch transcription path.
 
-The built-in Parakeet TDT v3 model is intentionally retained as the fallback model. It is offline-only and therefore continues to use the existing batch transcription path.
+## Side-by-side test APK
+
+The feature branch also has a `Build Unified streaming test APK` GitHub Actions workflow. Its debug artifact:
+
+- bundles Unified Q4_K_M directly, so no separate model import is needed;
+- uses application id `dev.notune.transcribe.unifiedtest`, so it can be installed beside the normal app;
+- labels itself **Offline Voice Input (Unified Test)**;
+- forces a versioned bundled-model extraction marker so a stale V3 extraction cannot be reused.
+
+This packaging change is applied only inside the test workflow; it does not alter the normal app artifact.
 
 ## Streaming profile
 
@@ -46,4 +55,4 @@ The important values for phone testing are:
 - **finalize time**: approximates the wait after speech ends.
 - **wall time**: useful for diagnosing a stream that falls behind despite acceptable individual feeds.
 
-If native streaming fails, the request automatically falls back to the existing one-shot transcription path using the audio retained for that recognition session.
+Feed/finalize failures retain the session PCM and fall back to the existing one-shot transcription path. A stream-creation failure is surfaced as a recognition error rather than silently discarding the request.
