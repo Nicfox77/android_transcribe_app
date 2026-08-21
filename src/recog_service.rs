@@ -7,8 +7,13 @@
 //! own: the calling keyboard expects *us* to decide when the user has finished speaking.
 //! So this module adds trailing-silence endpointing on top of the same `engine` model,
 //! and finalises automatically (it also honours an explicit `stopListening`/`cancel`).
+//!
+//! Microphone capture and model compute deliberately live on different threads. The
+//! audio callback only measures level and queues PCM; a worker owns the transcribe.cpp
+//! session for the request. Streaming-capable models therefore process audio while the
+//! user speaks instead of starting a full decode only after endpointing.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,7 +39,7 @@ const SPEECH_MARGIN: f32 = 0.08;
 const SILENCE_MS: u64 = 1500;
 /// If no speech is ever detected, finalise after this long anyway.
 const NO_SPEECH_TIMEOUT_MS: u64 = 7000;
-/// Hard cap on a single utterance (the engine internally chunks long audio).
+/// Hard cap on a single utterance.
 const MAX_SESSION_MS: u64 = 60000;
 /// Throttle interval for `rmsChanged` UI callbacks.
 const LEVEL_UPDATE_MS: u64 = 50;
@@ -44,11 +49,12 @@ const ERROR_AUDIO: i32 = 3;
 const ERROR_SERVER: i32 = 4;
 const ERROR_NO_MATCH: i32 = 7;
 
-/// State shared between the audio callback, the endpoint-monitor thread and the
-/// finaliser. Deliberately does NOT hold the cpal stream, to avoid an Arc cycle
+/// State shared between the audio callback, endpoint monitor and inference
+/// worker. Deliberately does NOT hold the cpal stream, to avoid an Arc cycle
 /// (the stream's callback holds an `Arc<Endpoint>`).
 struct Endpoint {
-    audio_buffer: Mutex<Vec<f32>>,
+    input_tx: crossbeam_channel::Sender<engine::RecognitionInput>,
+    sample_count: AtomicUsize,
     last_voice: Mutex<Instant>,
     noise_floor: Mutex<f32>,
     last_level_sent: Mutex<Instant>,
@@ -120,8 +126,8 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService
     });
 }
 
-/// Called from `onStartListening`. Begins microphone capture and arms the
-/// silence-based endpoint monitor.
+/// Called from `onStartListening`. Begins microphone capture, starts the model
+/// worker, and arms the silence-based endpoint monitor.
 #[no_mangle]
 pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService_startListening(
     env: JNIEnv,
@@ -138,20 +144,23 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService
     };
 
     // Tear down any session that is still around (e.g. the keyboard called
-    // startListening twice without cancel) so its monitor/finaliser can never
-    // deliver stale results to this new session.
+    // startListening twice without cancel) so its worker can never deliver
+    // stale results to this new session.
     {
         let mut guard = SESSION.lock().unwrap();
         if let Some(old) = guard.take() {
             old.shared.cancelled.store(true, Ordering::SeqCst);
             old.shared.finalized.store(true, Ordering::SeqCst);
+            let _ = old.shared.input_tx.send(engine::RecognitionInput::Cancel);
             *old.stream.lock().unwrap() = None;
         }
     }
 
+    let (input_tx, input_rx) = crossbeam_channel::unbounded();
     let now = Instant::now();
     let shared = Arc::new(Endpoint {
-        audio_buffer: Mutex::new(Vec::new()),
+        input_tx,
+        sample_count: AtomicUsize::new(0),
         last_voice: Mutex::new(now),
         noise_floor: Mutex::new(0.0),
         last_level_sent: Mutex::new(now),
@@ -210,25 +219,37 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService
         }
     }
 
+    // Install the session before either background thread can complete, so
+    // clear_session() can reliably identify this request.
+    *SESSION.lock().unwrap() = Some(Session {
+        shared: shared.clone(),
+        stream: stream_holder.clone(),
+    });
+
+    // Dedicated inference worker. If model loading is still finishing from the
+    // onCreate warm-up, microphone PCM simply queues here; once ready, Unified
+    // consumes it incrementally and catches up while speech continues.
+    let worker_shared = shared.clone();
+    let worker_stream = stream_holder.clone();
+    std::thread::spawn(move || inference_worker(worker_shared, worker_stream, input_rx));
+
     // Endpoint monitor.
     let mon_shared = shared.clone();
     let mon_stream = stream_holder.clone();
     std::thread::spawn(move || endpoint_monitor(mon_shared, mon_stream));
-
-    *SESSION.lock().unwrap() = Some(Session {
-        shared,
-        stream: stream_holder,
-    });
 }
 
-/// Called from `onStopListening`: the keyboard asked us to finish now. Finalise
-/// with whatever we've captured so far.
+/// Called from `onStopListening`: the keyboard asked us to finish now.
 #[no_mangle]
 pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService_stopListening(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    let session = SESSION.lock().unwrap().as_ref().map(|s| (s.shared.clone(), s.stream.clone()));
+    let session = SESSION
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| (s.shared.clone(), s.stream.clone()));
     if let Some((shared, stream)) = session {
         std::thread::spawn(move || finalize(shared, stream));
     }
@@ -244,6 +265,10 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService
     if let Some(session) = guard.as_ref() {
         session.shared.cancelled.store(true, Ordering::SeqCst);
         session.shared.finalized.store(true, Ordering::SeqCst);
+        let _ = session
+            .shared
+            .input_tx
+            .send(engine::RecognitionInput::Cancel);
         *session.stream.lock().unwrap() = None;
     }
     *guard = None;
@@ -265,7 +290,17 @@ fn audio_callback(shared: &Arc<Endpoint>, data: &[f32]) {
         return;
     }
 
-    shared.audio_buffer.lock().unwrap().extend_from_slice(data);
+    // Unbounded channel send is non-blocking with respect to model compute. At
+    // the current 60 s utterance cap, even a completely stalled worker queues
+    // only a few MiB of f32 PCM.
+    shared.sample_count.fetch_add(data.len(), Ordering::Relaxed);
+    if shared
+        .input_tx
+        .send(engine::RecognitionInput::Audio(data.to_vec()))
+        .is_err()
+    {
+        return;
+    }
 
     // RMS -> smoothed level in 0..1 (same scaling as voice_session).
     let mut sum = 0.0f32;
@@ -330,8 +365,9 @@ fn endpoint_monitor(shared: Arc<Endpoint>, stream: Arc<Mutex<Option<SendStream>>
     }
 }
 
-/// Stop capture, run the model on the buffered audio and deliver results/error.
-/// Idempotent: only the first caller (monitor or explicit stop) does the work.
+/// Stop capture and tell the already-running model worker that no more PCM is
+/// coming. The worker, not this endpoint thread, performs the final stream flush
+/// and delivers the transcript.
 fn finalize(shared: Arc<Endpoint>, stream: Arc<Mutex<Option<SendStream>>>) {
     if shared
         .finalized
@@ -341,11 +377,12 @@ fn finalize(shared: Arc<Endpoint>, stream: Arc<Mutex<Option<SendStream>>>) {
         return; // already finalised/cancelled
     }
 
-    // Stop the microphone (also drops the audio callback's Arc<Endpoint>).
+    // Stop the microphone first so Finish is guaranteed to be after the final
+    // audio chunk in the channel.
     *stream.lock().unwrap() = None;
 
-    let buffer = shared.audio_buffer.lock().unwrap().clone();
     let speech = shared.speech_started.load(Ordering::SeqCst);
+    let samples = shared.sample_count.load(Ordering::Relaxed);
 
     let mut env = match shared.jvm.attach_current_thread() {
         Ok(e) => e,
@@ -357,37 +394,94 @@ fn finalize(shared: Arc<Endpoint>, stream: Arc<Mutex<Option<SendStream>>>) {
         call_void(&mut env, target, "onEndOfSpeech");
     }
 
-    // ~0.2s minimum of audio to bother transcribing.
-    if buffer.len() < 3200 {
+    // ~0.2s minimum and at least one detected speech interval to bother
+    // transcribing. Cancel the model worker so it does not keep waiting.
+    if !speech || samples < 3200 {
+        shared.cancelled.store(true, Ordering::SeqCst);
+        let _ = shared.input_tx.send(engine::RecognitionInput::Cancel);
         call_error(&mut env, target, ERROR_NO_MATCH);
         clear_session(&shared);
         return;
     }
 
-    if engine::get_engine().is_none() {
-        if engine::ensure_loaded(&mut env, target).is_err() {
-            call_error(&mut env, target, ERROR_SERVER);
+    if shared
+        .input_tx
+        .send(engine::RecognitionInput::Finish)
+        .is_err()
+    {
+        log::error!("RecognitionService inference worker channel closed before Finish");
+        call_error(&mut env, target, ERROR_SERVER);
+        clear_session(&shared);
+    }
+}
+
+// --- Inference worker ---------------------------------------------------------
+
+fn inference_worker(
+    shared: Arc<Endpoint>,
+    stream: Arc<Mutex<Option<SendStream>>>,
+    receiver: crossbeam_channel::Receiver<engine::RecognitionInput>,
+) {
+    // The service warm-up normally means this is already loaded. Waiting here
+    // is still safe: microphone PCM accumulates in the channel while the model
+    // finishes loading, rather than delaying capture or blocking its callback.
+    if engine::get_engine().is_none()
+        && engine::ensure_loaded_from_thread(&shared.jvm, &shared.target).is_err()
+    {
+        fail_worker(&shared, &stream, ERROR_SERVER);
+        return;
+    }
+
+    let result = match engine::get_engine() {
+        Some(eng_arc) => engine::transcribe_recognition_shared(&eng_arc, &receiver),
+        None => Err("model unavailable after load".to_string()),
+    };
+
+    // A cancellation may race the last native finalize. Suppress stale results
+    // even if the model happened to finish before it consumed the queued Cancel.
+    if shared.cancelled.load(Ordering::SeqCst) {
+        clear_session(&shared);
+        return;
+    }
+
+    let mut env = match shared.jvm.attach_current_thread() {
+        Ok(e) => e,
+        Err(_) => {
             clear_session(&shared);
             return;
         }
-    }
+    };
+    let target = shared.target.as_obj();
 
-    match engine::get_engine() {
-        Some(eng_arc) => {
-            let res = engine::transcribe_shared(&eng_arc, buffer);
-            match res {
-                Ok(text) if !text.trim().is_empty() => call_results(&mut env, target, &text),
-                Ok(_) => call_error(&mut env, target, ERROR_NO_MATCH),
-                Err(e) => {
-                    log::error!("Transcription failed: {}", e);
-                    call_error(&mut env, target, ERROR_SERVER);
-                }
-            }
+    match result {
+        Ok(Some(text)) if !text.trim().is_empty() => call_results(&mut env, target, &text),
+        Ok(Some(_)) => call_error(&mut env, target, ERROR_NO_MATCH),
+        Ok(None) => {}
+        Err(e) => {
+            log::error!("RecognitionService transcription failed: {}", e);
+            call_error(&mut env, target, ERROR_SERVER);
         }
-        None => call_error(&mut env, target, ERROR_SERVER),
     }
 
     clear_session(&shared);
+}
+
+fn fail_worker(
+    shared: &Arc<Endpoint>,
+    stream: &Arc<Mutex<Option<SendStream>>>,
+    error_code: i32,
+) {
+    if shared.cancelled.load(Ordering::SeqCst) {
+        clear_session(shared);
+        return;
+    }
+    shared.cancelled.store(true, Ordering::SeqCst);
+    shared.finalized.store(true, Ordering::SeqCst);
+    *stream.lock().unwrap() = None;
+    if let Ok(mut env) = shared.jvm.attach_current_thread() {
+        call_error(&mut env, shared.target.as_obj(), error_code);
+    }
+    clear_session(shared);
 }
 
 /// Clear the global session, but only if it is still *this* session — a newer
