@@ -1,0 +1,132 @@
+name: Apply streaming partials patch
+
+on:
+  push:
+    branches:
+      - feature/parakeet-unified-streaming
+    paths:
+      - '.github/workflows/apply-streaming-partials.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/parakeet-unified-streaming
+
+      - name: Add native tentative-result callbacks
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          engine = Path('src/engine.rs')
+          s = engine.read_text()
+          old = '''                    let t = std::time::Instant::now();
+                    if let Err(e) = stream.feed(&chunk) {
+                        compute += t.elapsed();
+                        log::error!(
+                            "buffered stream feed failed after {:.1}s audio: {}; falling back to batch",
+                            fallback_audio.len() as f64 / 16_000.0,
+                            e
+                        );
+                        stream.reset();
+                        drop(stream);
+                        return self.transcribe_channel_batch(receiver, fallback_audio);
+                    }
+                    compute += t.elapsed();
+'''
+          new = '''                    let t = std::time::Instant::now();
+                    let update = match stream.feed(&chunk) {
+                        Ok(update) => update,
+                        Err(e) => {
+                            compute += t.elapsed();
+                            log::error!(
+                                "buffered stream feed failed after {:.1}s audio: {}; falling back to batch",
+                                fallback_audio.len() as f64 / 16_000.0,
+                                e
+                            );
+                            stream.reset();
+                            drop(stream);
+                            return self.transcribe_channel_batch(receiver, fallback_audio);
+                        }
+                    };
+                    compute += t.elapsed();
+
+                    // OnFinalize keeps the committed prefix empty during feed, but
+                    // Unified still exposes its current revisable hypothesis as
+                    // tentative text. Send that through RecognitionService partials;
+                    // clients render it as composing text and the final result remains
+                    // authoritative when the stream is finalized.
+                    if update.result_changed {
+                        let partial = stream.text().display();
+                        if !partial.trim().is_empty() {
+                            crate::recog_service::emit_partial(&partial);
+                        }
+                    }
+'''
+          if old not in s:
+              raise SystemExit('engine streaming feed marker not found')
+          engine.write_text(s.replace(old, new, 1))
+
+          recog = Path('src/recog_service.rs')
+          s = recog.read_text()
+          marker = '''fn call_error(env: &mut JNIEnv, obj: &JObject, code: i32) {
+    let _ = env.call_method(obj, "onError", "(I)V", &[code.into()]);
+}
+
+fn call_results(env: &mut JNIEnv, obj: &JObject, text: &str) {
+'''
+          replacement = '''fn call_error(env: &mut JNIEnv, obj: &JObject, code: i32) {
+    let _ = env.call_method(obj, "onError", "(I)V", &[code.into()]);
+}
+
+/// Sends the current revisable streaming hypothesis to the active Android
+/// RecognitionService client. This is deliberately best-effort: losing a
+/// partial must never fail or cancel the authoritative final transcription.
+pub(crate) fn emit_partial(text: &str) {
+    let target = {
+        let guard = SESSION.lock().unwrap();
+        let Some(session) = guard.as_ref() else {
+            return;
+        };
+        if session.shared.cancelled.load(Ordering::SeqCst)
+            || session.shared.finalized.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        (session.shared.jvm.clone(), session.shared.target.clone())
+    };
+
+    let (jvm, target) = target;
+    let Ok(mut env) = jvm.attach_current_thread() else {
+        return;
+    };
+    let Ok(jtxt) = env.new_string(text) else {
+        return;
+    };
+    let _ = env.call_method(
+        target.as_obj(),
+        "onPartialResults",
+        "(Ljava/lang/String;)V",
+        &[(&jtxt).into()],
+    );
+}
+
+fn call_results(env: &mut JNIEnv, obj: &JObject, text: &str) {
+'''
+          if marker not in s:
+              raise SystemExit('RecognitionService callback marker not found')
+          recog.write_text(s.replace(marker, replacement, 1))
+          PY
+
+      - name: Commit partial-result implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- src/engine.rs src/recog_service.rs
+          git commit -m "Emit streaming partial recognition results"
+          git push origin HEAD:feature/parakeet-unified-streaming
