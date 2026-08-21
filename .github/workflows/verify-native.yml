@@ -104,3 +104,34 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+  heliboard-inline-client:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout HeliBoard inline voice branch
+        uses: actions/checkout@v4
+        with:
+          repository: Nicfox77/HeliBoard
+          ref: feature/parakeet-inline-voice
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build HeliBoard debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Upload HeliBoard inline voice APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HeliBoard-inline-voice-debug
+          path: app/build/outputs/apk/debug/*-debug*.apk
+          if-no-files-found: error
+          retention-days: 14
