@@ -1,24 +1,24 @@
 //! Native backend for `VoiceRecognitionService`, the `android.speech.RecognitionService`
-//! implementation that lets *other* keyboards/apps (SwiftKey, Gboard, …) use this app
-//! as their offline speech-to-text provider via the system `SpeechRecognizer` API.
+//! implementation that lets *other* keyboards/apps use this app as their offline
+//! speech-to-text provider via the system `SpeechRecognizer` API.
 //!
 //! Unlike the IME / `RecognizeActivity` surfaces (which have their own UI and a manual
 //! "tap to stop" control via `voice_session`), a `RecognitionService` has no UI of its
-//! own: the calling keyboard expects *us* to decide when the user has finished speaking.
+//! own: the calling keyboard expects us to decide when the user has finished speaking.
 //! So this module adds trailing-silence endpointing on top of the same `engine` model,
 //! and finalises automatically (it also honours an explicit `stopListening`/`cancel`).
 //!
-//! Microphone capture and model compute deliberately live on different threads. The
-//! audio callback only measures level and queues PCM; a worker owns the transcribe.cpp
-//! session for the request. Streaming-capable models therefore process audio while the
-//! user speaks instead of starting a full decode only after endpointing.
+//! RecognitionService microphone capture intentionally lives in Java `AudioRecord`,
+//! where Android can attach `Callback.getCallingAttributionSource()` to the recorder.
+//! PCM16 is forwarded here over JNI; this module converts it to f32, performs VAD,
+//! and feeds a dedicated model worker. Streaming-capable models therefore process
+//! audio while the user speaks instead of starting a full decode only after endpointing.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use jni::objects::{GlobalRef, JClass, JObject};
+use jni::objects::{GlobalRef, JClass, JObject, JShortArray};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
 
@@ -45,13 +45,10 @@ const MAX_SESSION_MS: u64 = 60000;
 const LEVEL_UPDATE_MS: u64 = 50;
 
 // Mirror of android.speech.SpeechRecognizer error codes we report.
-const ERROR_AUDIO: i32 = 3;
 const ERROR_SERVER: i32 = 4;
 const ERROR_NO_MATCH: i32 = 7;
 
-/// State shared between the audio callback, endpoint monitor and inference
-/// worker. Deliberately does NOT hold the cpal stream, to avoid an Arc cycle
-/// (the stream's callback holds an `Arc<Endpoint>`).
+/// State shared between Java audio delivery, endpoint monitor and inference worker.
 struct Endpoint {
     input_tx: crossbeam_channel::Sender<engine::RecognitionInput>,
     sample_count: AtomicUsize,
@@ -66,6 +63,9 @@ struct Endpoint {
     target: GlobalRef,
 }
 
+/// `stream` is retained as the same lifetime/stop handle used by the existing
+/// endpointing code. For the attributed RecognitionService path it stays `None`;
+/// Java owns and closes the `AudioRecord` before calling native finalization.
 struct Session {
     shared: Arc<Endpoint>,
     stream: Arc<Mutex<Option<SendStream>>>,
@@ -126,8 +126,9 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService
     });
 }
 
-/// Called from `onStartListening`. Begins microphone capture, starts the model
-/// worker, and arms the silence-based endpoint monitor.
+/// Called from `onStartListening`. Creates the model-side session and endpoint
+/// monitor. Java opens the caller-attributed `AudioRecord` immediately after this
+/// returns and forwards PCM through [`Java_dev_notune_transcribe_VoiceRecognitionService_feedAudio`].
 #[no_mangle]
 pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService_startListening(
     env: JNIEnv,
@@ -173,52 +174,6 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService
     });
     let stream_holder: Arc<Mutex<Option<SendStream>>> = Arc::new(Mutex::new(None));
 
-    // Tell the keyboard we're ready to receive speech.
-    {
-        let mut env2 = match jvm.attach_current_thread() {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        call_void(&mut env2, shared.target.as_obj(), "onReadyForSpeech");
-    }
-
-    // Open the microphone (16 kHz mono, matching the model + voice_session).
-    let host = cpal::default_host();
-    let device = match host.default_input_device() {
-        Some(d) => d,
-        None => {
-            let mut env2 = jvm.attach_current_thread().unwrap();
-            call_error(&mut env2, shared.target.as_obj(), ERROR_AUDIO);
-            return;
-        }
-    };
-    let config = cpal::StreamConfig {
-        channels: 1,
-        sample_rate: cpal::SampleRate(16000),
-        buffer_size: cpal::BufferSize::Default,
-    };
-
-    let cb_shared = shared.clone();
-    let stream = device.build_input_stream(
-        &config,
-        move |data: &[f32], _: &_| audio_callback(&cb_shared, data),
-        |e| log::error!("RecognitionService stream error: {}", e),
-        None,
-    );
-
-    match stream {
-        Ok(s) => {
-            s.play().ok();
-            *stream_holder.lock().unwrap() = Some(SendStream(s));
-        }
-        Err(e) => {
-            log::error!("Failed to open microphone: {}", e);
-            let mut env2 = jvm.attach_current_thread().unwrap();
-            call_error(&mut env2, shared.target.as_obj(), ERROR_AUDIO);
-            return;
-        }
-    }
-
     // Install the session before either background thread can complete, so
     // clear_session() can reliably identify this request.
     *SESSION.lock().unwrap() = Some(Session {
@@ -237,6 +192,38 @@ pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService
     let mon_shared = shared.clone();
     let mon_stream = stream_holder.clone();
     std::thread::spawn(move || endpoint_monitor(mon_shared, mon_stream));
+}
+
+/// PCM16 delivered by the caller-attributed Java `AudioRecord`.
+#[no_mangle]
+pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService_feedAudio(
+    mut env: JNIEnv,
+    _class: JClass,
+    samples: JShortArray,
+    length: jni::sys::jint,
+) {
+    if length <= 0 {
+        return;
+    }
+
+    let shared = SESSION
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.shared.clone());
+    let Some(shared) = shared else {
+        return;
+    };
+    if shared.finalized.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let mut pcm = vec![0i16; length as usize];
+    if env.get_short_array_region(&samples, 0, &mut pcm).is_err() {
+        return;
+    }
+    let audio: Vec<f32> = pcm.into_iter().map(|x| x as f32 / 32768.0).collect();
+    audio_callback(&shared, &audio);
 }
 
 /// Called from `onStopListening`: the keyboard asked us to finish now.
@@ -366,8 +353,8 @@ fn endpoint_monitor(shared: Arc<Endpoint>, stream: Arc<Mutex<Option<SendStream>>
 }
 
 /// Stop capture and tell the already-running model worker that no more PCM is
-/// coming. The worker, not this endpoint thread, performs the final stream flush
-/// and delivers the transcript.
+/// coming. Java closes `AudioRecord` first for explicit stop; auto-endpointing
+/// calls back into Java's `onEndOfSpeech`, which closes it there as well.
 fn finalize(shared: Arc<Endpoint>, stream: Arc<Mutex<Option<SendStream>>>) {
     if shared
         .finalized
@@ -377,8 +364,6 @@ fn finalize(shared: Arc<Endpoint>, stream: Arc<Mutex<Option<SendStream>>>) {
         return; // already finalised/cancelled
     }
 
-    // Stop the microphone first so Finish is guaranteed to be after the final
-    // audio chunk in the channel.
     *stream.lock().unwrap() = None;
 
     let speech = shared.speech_started.load(Ordering::SeqCst);
