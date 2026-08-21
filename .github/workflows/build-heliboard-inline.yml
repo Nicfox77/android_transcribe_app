@@ -1,0 +1,50 @@
+name: Build HeliBoard inline voice APK
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout HeliBoard inline voice branch
+        uses: actions/checkout@v4
+        with:
+          repository: Nicfox77/HeliBoard
+          ref: feature/parakeet-inline-voice
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v3
+
+      - name: Limit test APK to arm64
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/build.gradle.kts')
+          s = p.read_text()
+          old = 'abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))'
+          new = 'abiFilters.add("arm64-v8a")'
+          if old not in s:
+              raise SystemExit('expected abiFilters declaration not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build HeliBoard debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Upload HeliBoard inline voice APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HeliBoard-inline-voice-arm64
+          path: app/build/outputs/apk/debug/*-debug*.apk
+          if-no-files-found: error
+          retention-days: 14
