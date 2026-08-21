@@ -241,16 +241,14 @@ impl Engine {
             ..Default::default()
         };
 
-        let mut stream = match self.session.stream(&run_opts, &stream_opts) {
-            Ok(stream) => stream,
-            Err(e) => {
-                log::warn!(
-                    "buffered stream begin failed ({}); falling back to batch transcription",
-                    e
-                );
-                return self.transcribe_channel_batch(receiver, Vec::new());
-            }
-        };
+        // If model capability detection says buffered streaming is supported,
+        // stream creation should succeed. Propagate a begin failure instead of
+        // borrowing the same Session a second time from the Err arm; feed and
+        // finalize failures below still retain the one-shot fallback.
+        let mut stream = self
+            .session
+            .stream(&run_opts, &stream_opts)
+            .map_err(|e| format!("buffered stream begin failed: {}", e))?;
 
         let started = std::time::Instant::now();
         let mut compute = std::time::Duration::ZERO;
@@ -360,7 +358,7 @@ static LOAD_STATE: Lazy<(Mutex<LoadState>, Condvar)> =
 enum LoadState {
     /// No load in progress
     Idle,
-    /// A thread is currently loading the model
+    /// A thread is currently loading
     Loading,
     /// Loading completed successfully
     Done,
