@@ -15,13 +15,7 @@ import java.util.ArrayList;
 /**
  * Exposes the offline transcriber as a system speech-to-text provider via
  * {@link android.speech.RecognitionService}. This is the API that keyboards
- * (Microsoft SwiftKey, Gboard, …) use through {@link SpeechRecognizer} to find
- * and drive an on-device recognizer.
- *
- * <p>Because the service is declared in the manifest, it is discoverable at all
- * times — even when the app process is not running or has been force-stopped by
- * the OS — so {@code SpeechRecognizer.isRecognitionAvailable()} stays true and
- * keyboards no longer report that "Google Speech Services aren't installed".
+ * use through {@link SpeechRecognizer} to find and drive an on-device recognizer.
  *
  * <p>The heavy lifting (capture, silence endpointing, model inference) happens in
  * native code ({@code src/recog_service.rs}); this class only bridges the
@@ -131,6 +125,19 @@ public class VoiceRecognitionService extends RecognitionService {
             Callback cb = mCallback;
             if (cb == null) return;
             try { cb.endOfSpeech(); } catch (RemoteException ignored) {}
+        });
+    }
+
+    /** Deliver a revisable streaming hypothesis without ending recognition. */
+    public void onPartialResults(String text) {
+        mainHandler.post(() -> {
+            Callback cb = mCallback;
+            if (cb == null || text == null || text.trim().isEmpty()) return;
+            ArrayList<String> hypotheses = new ArrayList<>();
+            hypotheses.add(text);
+            Bundle bundle = new Bundle();
+            bundle.putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, hypotheses);
+            try { cb.partialResults(bundle); } catch (RemoteException ignored) {}
         });
     }
 
