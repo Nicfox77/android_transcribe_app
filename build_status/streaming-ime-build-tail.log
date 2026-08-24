@@ -1,0 +1,271 @@
+===== native build tail =====
+    Building arm64-v8a (aarch64-linux-android)
+[1m[92m    Updating[0m crates.io index
+[1m[92m Downloading[0m crates ...
+[1m[92m  Downloaded[0m android_log-sys v0.3.2
+[1m[92m  Downloaded[0m android_logger v0.13.3
+[1m[92m  Downloaded[0m alsa v0.9.1
+[1m[92m  Downloaded[0m cesu8 v1.1.0
+[1m[92m  Downloaded[0m alsa-sys v0.3.1
+[1m[92m  Downloaded[0m itoa v1.0.15
+[1m[92m  Downloaded[0m proc-macro-crate v3.4.0
+[1m[92m  Downloaded[0m jni-sys v0.3.0
+[1m[92m  Downloaded[0m crossbeam-utils v0.8.21
+[1m[92m  Downloaded[0m autocfg v1.5.0
+[1m[92m  Downloaded[0m cmake v0.1.58
+[1m[92m  Downloaded[0m dasp_sample v0.11.0
+[1m[92m  Downloaded[0m ndk-context v0.1.1
+[1m[92m  Downloaded[0m same-file v1.0.6
+[1m[92m  Downloaded[0m oboe v0.6.1
+[1m[92m  Downloaded[0m env_logger v0.10.2
+[1m[92m  Downloaded[0m thiserror v2.0.17
+[1m[92m  Downloaded[0m num_enum v0.7.5
+[1m[92m  Downloaded[0m once_cell v1.21.3
+[1m[92m  Downloaded[0m bitflags v2.10.0
+[1m[92m  Downloaded[0m pkg-config v0.3.32
+[1m[92m  Downloaded[0m anyhow v1.0.100
+[1m[92m  Downloaded[0m toml_datetime v0.7.3
+[1m[92m  Downloaded[0m walkdir v2.5.0
+[1m[92m  Downloaded[0m toml_parser v1.0.4
+[1m[92m  Downloaded[0m quote v1.0.42
+[1m[92m  Downloaded[0m num-derive v0.4.2
+[1m[92m  Downloaded[0m ryu v1.0.20
+[1m[92m  Downloaded[0m thiserror-impl v2.0.17
+[1m[92m  Downloaded[0m cc v1.2.47
+[1m[92m  Downloaded[0m find-msvc-tools v0.1.5
+[1m[92m  Downloaded[0m shlex v1.3.0
+[1m[92m  Downloaded[0m transcribe-cpp v0.1.3
+[1m[92m  Downloaded[0m toml_edit v0.23.7
+[1m[92m  Downloaded[0m crossbeam-channel v0.5.15
+[1m[92m  Downloaded[0m num_enum_derive v0.7.5
+[1m[92m  Downloaded[0m log v0.4.28
+[1m[92m  Downloaded[0m unicode-ident v1.0.22
+[1m[92m  Downloaded[0m bytes v1.11.0
+[1m[92m  Downloaded[0m jobserver v0.1.34
+[1m[92m  Downloaded[0m rustversion v1.0.22
+[1m[92m  Downloaded[0m memchr v2.7.6
+[1m[92m  Downloaded[0m ndk v0.8.0
+[1m[92m  Downloaded[0m serde_core v1.0.228
+[1m[92m  Downloaded[0m proc-macro2 v1.0.103
+[1m[92m  Downloaded[0m cpal v0.15.3
+[1m[92m  Downloaded[0m aho-corasick v1.1.4
+[1m[92m  Downloaded[0m jni v0.21.1
+[1m[92m  Downloaded[0m combine v4.6.7
+[1m[92m  Downloaded[0m hashbrown v0.16.1
+[1m[92m  Downloaded[0m indexmap v2.12.1
+[1m[92m  Downloaded[0m regex v1.12.2
+[1m[92m  Downloaded[0m serde_json v1.0.145
+[1m[92m  Downloaded[0m winnow v0.7.13
+[1m[92m  Downloaded[0m oboe-sys v0.6.1
+[1m[92m  Downloaded[0m syn v2.0.110
+[1m[92m  Downloaded[0m ndk-sys v0.5.0+25.2.9519653
+[1m[92m  Downloaded[0m regex-syntax v0.8.8
+[1m[92m  Downloaded[0m regex-automata v0.4.13
+[1m[92m  Downloaded[0m libc v0.2.177
+[1m[92m  Downloaded[0m transcribe-cpp-sys v0.1.3
+[1m[92m   Compiling[0m libc v0.2.177
+[1m[92m   Compiling[0m proc-macro2 v1.0.103
+[1m[92m   Compiling[0m quote v1.0.42
+[1m[92m   Compiling[0m unicode-ident v1.0.22
+[1m[92m   Compiling[0m find-msvc-tools v0.1.5
+[1m[92m   Compiling[0m shlex v1.3.0
+[1m[92m   Compiling[0m serde_core v1.0.228
+[1m[92m   Compiling[0m memchr v2.7.6
+[1m[92m   Compiling[0m hashbrown v0.16.1
+[1m[92m   Compiling[0m equivalent v1.0.2
+[1m[92m   Compiling[0m syn v2.0.110
+[1m[92m   Compiling[0m serde_json v1.0.145
+[1m[92m   Compiling[0m winnow v0.7.13
+[1m[92m   Compiling[0m indexmap v2.12.1
+[1m[92m   Compiling[0m jobserver v0.1.34
+[1m[92m   Compiling[0m cc v1.2.47
+[1m[92m   Compiling[0m toml_parser v1.0.4
+[1m[92m   Compiling[0m itoa v1.0.15
+[1m[92m   Compiling[0m toml_datetime v0.7.3
+[1m[92m   Compiling[0m log v0.4.28
+[1m[92m   Compiling[0m ryu v1.0.20
+[1m[92m   Compiling[0m toml_edit v0.23.7
+[1m[92m   Compiling[0m cmake v0.1.58
+[1m[92m   Compiling[0m thiserror v1.0.69
+[1m[92m   Compiling[0m rustversion v1.0.22
+[1m[92m   Compiling[0m proc-macro-crate v3.4.0
+[1m[92m   Compiling[0m thiserror-impl v1.0.69
+[1m[92m   Compiling[0m autocfg v1.5.0
+[1m[92m   Compiling[0m jni-sys v0.3.0
+[1m[92m   Compiling[0m num_enum_derive v0.7.5
+[1m[92m   Compiling[0m num-traits v0.2.19
+[1m[92m   Compiling[0m transcribe-cpp-sys v0.1.3
+[1m[92m   Compiling[0m oboe-sys v0.6.1
+[1m[92m   Compiling[0m aho-corasick v1.1.4
+[1m[92m   Compiling[0m bytes v1.11.0
+[1m[92m   Compiling[0m regex-syntax v0.8.8
+[1m[92m   Compiling[0m combine v4.6.7
+[1m[92m   Compiling[0m regex-automata v0.4.13
+[1m[92m   Compiling[0m num_enum v0.7.5
+[1m[92m   Compiling[0m ndk-sys v0.5.0+25.2.9519653
+[1m[92m   Compiling[0m cesu8 v1.1.0
+[1m[92m   Compiling[0m transcribe-cpp v0.1.3
+[1m[92m   Compiling[0m bitflags v2.10.0
+[1m[92m   Compiling[0m thiserror v2.0.17
+[1m[92m   Compiling[0m crossbeam-utils v0.8.21
+[1m[92m   Compiling[0m cfg-if v1.0.4
+[1m[92m   Compiling[0m jni v0.21.1
+[1m[92m   Compiling[0m ndk v0.8.0
+[1m[92m   Compiling[0m regex v1.12.2
+[1m[92m   Compiling[0m num-derive v0.4.2
+[1m[92m   Compiling[0m thiserror-impl v2.0.17
+[1m[92m   Compiling[0m cpal v0.15.3
+[1m[92m   Compiling[0m ndk-context v0.1.1
+[1m[92m   Compiling[0m anyhow v1.0.100
+[1m[92m   Compiling[0m env_logger v0.10.2
+[1m[92m   Compiling[0m dasp_sample v0.11.0
+[1m[92m   Compiling[0m android_log-sys v0.3.2
+[1m[92m   Compiling[0m once_cell v1.21.3
+[1m[92m   Compiling[0m android_transcribe_app v0.1.0 (/home/runner/work/android_transcribe_app/android_transcribe_app)
+[1m[92m   Compiling[0m android_logger v0.13.3
+[1m[92m   Compiling[0m crossbeam-channel v0.5.15
+[1m[92m   Compiling[0m oboe v0.6.1
+[1m[33mwarning[0m[1m: unused import: `GlobalRef`[0m
+  [1m[94m--> [0msrc/heliboard.rs:11:20
+   [1m[94m|[0m
+[1m[94m11[0m [1m[94m|[0m use jni::objects::{GlobalRef, JObject, JShortArray};
+   [1m[94m|[0m                    [1m[33m^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: variable does not need to be mutable[0m
+   [1m[94m--> [0msrc/heliboard.rs:146:5
+    [1m[94m|[0m
+[1m[94m146[0m [1m[94m|[0m     mut env: JNIEnv,
+    [1m[94m|[0m     [1m[94m----[0m[1m[33m^^^[0m
+    [1m[94m|[0m     [1m[94m|[0m
+    [1m[94m|[0m     [1m[94mhelp: remove this `mut`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: variable does not need to be mutable[0m
+  [1m[94m--> [0msrc/main_activity.rs:51:5
+   [1m[94m|[0m
+[1m[94m51[0m [1m[94m|[0m     mut env: JNIEnv,
+   [1m[94m|[0m     [1m[94m----[0m[1m[33m^^^[0m
+   [1m[94m|[0m     [1m[94m|[0m
+   [1m[94m|[0m     [1m[94mhelp: remove this `mut`[0m
+
+[1m[33mwarning[0m[1m: variable does not need to be mutable[0m
+   [1m[94m--> [0msrc/recog_service.rs:200:5
+    [1m[94m|[0m
+[1m[94m200[0m [1m[94m|[0m     mut env: JNIEnv,
+    [1m[94m|[0m     [1m[94m----[0m[1m[33m^^^[0m
+    [1m[94m|[0m     [1m[94m|[0m
+    [1m[94m|[0m     [1m[94mhelp: remove this `mut`[0m
+
+[1m[33mwarning[0m: `android_transcribe_app` (lib) generated 4 warnings (run `cargo fix --lib -p android_transcribe_app` to apply 4 suggestions)
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 1m 05s
+===== APK build tail =====
+Downloading https://services.gradle.org/distributions/gradle-8.9-bin.zip
+............10%.............20%.............30%.............40%.............50%.............60%.............70%.............80%.............90%.............100%
+
+Welcome to Gradle 8.9!
+
+Here are the highlights of this release:
+ - Enhanced Error and Warning Messages
+ - IDE Integration Improvements
+ - Daemon JVM Information
+
+For more details see https://docs.gradle.org/8.9/release-notes.html
+
+Starting a Gradle Daemon (subsequent builds will be faster)
+
+> Task :app:cargoNdkBuild
+    Building arm64-v8a (aarch64-linux-android)
+[1m[92m   Compiling[0m android_transcribe_app v0.1.0 (/home/runner/work/android_transcribe_app/android_transcribe_app)
+[1m[33mwarning[0m[1m: unused import: `GlobalRef`[0m
+  [1m[94m--> [0msrc/heliboard.rs:11:20
+   [1m[94m|[0m
+[1m[94m11[0m [1m[94m|[0m use jni::objects::{GlobalRef, JObject, JShortArray};
+   [1m[94m|[0m                    [1m[33m^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: variable does not need to be mutable[0m
+   [1m[94m--> [0msrc/heliboard.rs:146:5
+    [1m[94m|[0m
+[1m[94m146[0m [1m[94m|[0m     mut env: JNIEnv,
+    [1m[94m|[0m     [1m[94m----[0m[1m[33m^^^[0m
+    [1m[94m|[0m     [1m[94m|[0m
+    [1m[94m|[0m     [1m[94mhelp: remove this `mut`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m[1m: variable does not need to be mutable[0m
+  [1m[94m--> [0msrc/main_activity.rs:51:5
+   [1m[94m|[0m
+[1m[94m51[0m [1m[94m|[0m     mut env: JNIEnv,
+   [1m[94m|[0m     [1m[94m----[0m[1m[33m^^^[0m
+   [1m[94m|[0m     [1m[94m|[0m
+   [1m[94m|[0m     [1m[94mhelp: remove this `mut`[0m
+
+[1m[33mwarning[0m[1m: variable does not need to be mutable[0m
+   [1m[94m--> [0msrc/recog_service.rs:200:5
+    [1m[94m|[0m
+[1m[94m200[0m [1m[94m|[0m     mut env: JNIEnv,
+    [1m[94m|[0m     [1m[94m----[0m[1m[33m^^^[0m
+    [1m[94m|[0m     [1m[94m|[0m
+    [1m[94m|[0m     [1m[94mhelp: remove this `mut`[0m
+
+[1m[33mwarning[0m: `android_transcribe_app` (lib) generated 4 warnings (run `cargo fix --lib -p android_transcribe_app` to apply 4 suggestions)
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 1.80s
+     Copying libraries to /home/runner/work/android_transcribe_app/android_transcribe_app/app/src/main/jniLibs
+Copied libc++_shared.so from NDK
+
+> Task :app:downloadModels
+  ↓ Downloading parakeet-unified-en-0.6b-Q4_K_M.gguf...
+  ✓ parakeet-unified-en-0.6b-Q4_K_M.gguf verified
+
+> Task :app:preBuild
+> Task :app:preDebugBuild
+> Task :app:mergeDebugNativeDebugMetadata NO-SOURCE
+> Task :app:javaPreCompileDebug
+> Task :app:generateDebugResValues
+> Task :app:checkDebugAarMetadata
+> Task :app:mapDebugSourceSetPaths
+> Task :app:generateDebugResources
+> Task :app:packageDebugResources
+> Task :app:mergeDebugResources
+> Task :app:createDebugCompatibleScreenManifests
+> Task :app:extractDeepLinksDebug
+> Task :app:parseDebugLocalResources
+> Task :app:processDebugMainManifest
+> Task :app:processDebugManifest
+> Task :app:mergeDebugShaders
+> Task :app:compileDebugShaders NO-SOURCE
+> Task :app:generateDebugAssets UP-TO-DATE
+> Task :app:mergeDebugAssets
+> Task :app:processDebugJavaRes NO-SOURCE
+> Task :app:processDebugManifestForPackage
+> Task :app:checkDebugDuplicateClasses
+> Task :app:mergeDebugJavaResource
+> Task :app:desugarDebugFileDependencies
+> Task :app:processDebugResources
+> Task :app:compressDebugAssets
+> Task :app:mergeExtDexDebug
+
+> Task :app:compileDebugJavaWithJavac
+Note: Some input files use or override a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :app:mergeLibDexDebug
+> Task :app:dexBuilderDebug
+> Task :app:mergeDebugJniLibFolders
+> Task :app:mergeProjectDexDebug
+> Task :app:mergeDebugNativeLibs
+> Task :app:validateSigningDebug
+> Task :app:writeDebugAppMetadata
+> Task :app:writeDebugSigningConfigVersions
+> Task :app:stripDebugDebugSymbols
+> Task :app:packageDebug
+> Task :app:createDebugApkListingFileRedirect
+> Task :app:assembleDebug
+
+BUILD SUCCESSFUL in 1m 40s
+35 actionable tasks: 35 executed

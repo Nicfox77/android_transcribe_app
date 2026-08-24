@@ -1,0 +1,544 @@
+name: Build attributed RecognitionService test APK
+
+on:
+  push:
+    branches:
+      - feature/parakeet-unified-streaming
+    paths:
+      - '.github/workflows/build-attributed-recognition-test.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "ndk;28.0.13004108"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          cargo install cargo-ndk
+
+      - name: Use attributed Android AudioRecord for RecognitionService
+        run: |
+          cat > app/src/main/java/dev/notune/transcribe/VoiceRecognitionService.java <<'JAVA'
+          package dev.notune.transcribe;
+
+          import android.content.Context;
+          import android.content.ContextParams;
+          import android.content.Intent;
+          import android.media.AudioFormat;
+          import android.media.AudioRecord;
+          import android.media.MediaRecorder;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.RemoteException;
+          import android.speech.RecognitionService;
+          import android.speech.SpeechRecognizer;
+          import android.util.Log;
+
+          import java.util.ArrayList;
+
+          /** RecognitionService bridge with caller-attributed microphone capture. */
+          public class VoiceRecognitionService extends RecognitionService {
+              private static final String TAG = "OfflineVoiceInput";
+              private static final int SAMPLE_RATE = 16000;
+
+              static {
+                  try {
+                      System.loadLibrary("c++_shared");
+                      System.loadLibrary("android_transcribe_app");
+                  } catch (UnsatisfiedLinkError e) {
+                      Log.e(TAG, "Failed to load native libraries", e);
+                  }
+              }
+
+              private final Handler mainHandler = new Handler(Looper.getMainLooper());
+              private Callback mCallback;
+              private volatile boolean mRecording;
+              private AudioRecord mAudioRecord;
+              private Thread mAudioThread;
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  try { initNative(this); } catch (Throwable t) { Log.e(TAG, "initNative failed", t); }
+              }
+
+              @Override
+              protected void onStartListening(Intent recognizerIntent, Callback callback) {
+                  mCallback = callback;
+                  try {
+                      Context recordingContext = this;
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                          recordingContext = createContext(
+                                  new ContextParams.Builder()
+                                          .setNextAttributionSource(callback.getCallingAttributionSource())
+                                          .build());
+                      }
+
+                      // Set up the Rust streaming worker first, then start an AudioRecord
+                      // explicitly attributed to the SpeechRecognizer caller.
+                      startListening(this);
+                      startAudioCapture(recordingContext);
+                  } catch (Throwable t) {
+                      Log.e(TAG, "startListening failed", t);
+                      stopAudioCapture();
+                      safeError(SpeechRecognizer.ERROR_AUDIO);
+                  }
+              }
+
+              @Override
+              protected void onStopListening(Callback callback) {
+                  // Stop producer first so Finish is ordered after the last PCM chunk.
+                  stopAudioCapture();
+                  try { stopListening(); } catch (Throwable t) { Log.e(TAG, "stopListening failed", t); }
+              }
+
+              @Override
+              protected void onCancel(Callback callback) {
+                  stopAudioCapture();
+                  try { cancelNative(); } catch (Throwable t) { Log.e(TAG, "cancel failed", t); }
+              }
+
+              @Override
+              public void onDestroy() {
+                  stopAudioCapture();
+                  try { destroyNative(); } catch (Throwable t) { Log.e(TAG, "destroyNative failed", t); }
+                  super.onDestroy();
+              }
+
+              private void startAudioCapture(Context recordingContext) {
+                  stopAudioCapture();
+
+                  int minBytes = AudioRecord.getMinBufferSize(
+                          SAMPLE_RATE,
+                          AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT);
+                  int bufferBytes = Math.max(minBytes > 0 ? minBytes : 0, SAMPLE_RATE * 2);
+
+                  AudioRecord.Builder builder = new AudioRecord.Builder()
+                          .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+                          .setAudioFormat(new AudioFormat.Builder()
+                                  .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                  .setSampleRate(SAMPLE_RATE)
+                                  .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                                  .build())
+                          .setBufferSizeInBytes(bufferBytes);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      builder.setContext(recordingContext);
+                  }
+
+                  AudioRecord recorder = builder.build();
+                  if (recorder.getState() != AudioRecord.STATE_INITIALIZED) {
+                      recorder.release();
+                      throw new IllegalStateException("AudioRecord failed to initialize");
+                  }
+
+                  mAudioRecord = recorder;
+                  mRecording = true;
+                  recorder.startRecording();
+                  if (recorder.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
+                      stopAudioCapture();
+                      throw new IllegalStateException("AudioRecord failed to start");
+                  }
+
+                  onReadyForSpeech();
+                  mAudioThread = new Thread(() -> {
+                      short[] buffer = new short[1024];
+                      while (mRecording) {
+                          AudioRecord current = mAudioRecord;
+                          if (current == null) break;
+                          int count = current.read(buffer, 0, buffer.length, AudioRecord.READ_BLOCKING);
+                          if (count > 0) {
+                              try {
+                                  feedAudio(buffer, count);
+                              } catch (Throwable t) {
+                                  Log.e(TAG, "feedAudio failed", t);
+                                  mainHandler.post(() -> onError(SpeechRecognizer.ERROR_CLIENT));
+                                  break;
+                              }
+                          } else if (count < 0 && mRecording) {
+                              Log.e(TAG, "AudioRecord read failed: " + count);
+                              mainHandler.post(() -> onError(SpeechRecognizer.ERROR_AUDIO));
+                              break;
+                          }
+                      }
+                  }, "offline-voice-attributed-capture");
+                  mAudioThread.start();
+              }
+
+              private synchronized void stopAudioCapture() {
+                  mRecording = false;
+                  AudioRecord recorder = mAudioRecord;
+                  mAudioRecord = null;
+                  if (recorder != null) {
+                      try { recorder.stop(); } catch (Throwable ignored) {}
+                      try { recorder.release(); } catch (Throwable ignored) {}
+                  }
+                  Thread thread = mAudioThread;
+                  mAudioThread = null;
+                  if (thread != null && thread != Thread.currentThread()) {
+                      try { thread.join(250); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                  }
+              }
+
+              public void onReadyForSpeech() {
+                  mainHandler.post(() -> {
+                      Callback cb = mCallback;
+                      if (cb == null) return;
+                      try { cb.readyForSpeech(new Bundle()); } catch (RemoteException ignored) {}
+                  });
+              }
+
+              public void onBeginningOfSpeech() {
+                  mainHandler.post(() -> {
+                      Callback cb = mCallback;
+                      if (cb == null) return;
+                      try { cb.beginningOfSpeech(); } catch (RemoteException ignored) {}
+                  });
+              }
+
+              public void onRmsChanged(float rmsdB) {
+                  mainHandler.post(() -> {
+                      Callback cb = mCallback;
+                      if (cb == null) return;
+                      try { cb.rmsChanged(rmsdB); } catch (RemoteException ignored) {}
+                  });
+              }
+
+              public void onEndOfSpeech() {
+                  stopAudioCapture();
+                  mainHandler.post(() -> {
+                      Callback cb = mCallback;
+                      if (cb == null) return;
+                      try { cb.endOfSpeech(); } catch (RemoteException ignored) {}
+                  });
+              }
+
+              public void onPartialResults(String text) {
+                  mainHandler.post(() -> {
+                      Callback cb = mCallback;
+                      if (cb == null || text == null || text.trim().isEmpty()) return;
+                      ArrayList<String> hypotheses = new ArrayList<>();
+                      hypotheses.add(text);
+                      Bundle bundle = new Bundle();
+                      bundle.putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, hypotheses);
+                      try { cb.partialResults(bundle); } catch (RemoteException ignored) {}
+                  });
+              }
+
+              public void onResults(String text) {
+                  stopAudioCapture();
+                  mainHandler.post(() -> {
+                      Callback cb = mCallback;
+                      if (cb == null) return;
+                      ArrayList<String> hypotheses = new ArrayList<>();
+                      hypotheses.add(text);
+                      Bundle bundle = new Bundle();
+                      bundle.putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, hypotheses);
+                      try { cb.results(bundle); } catch (RemoteException ignored) {}
+                      mCallback = null;
+                  });
+              }
+
+              public void onError(int errorCode) {
+                  stopAudioCapture();
+                  mainHandler.post(() -> {
+                      Callback cb = mCallback;
+                      if (cb == null) return;
+                      try { cb.error(errorCode); } catch (RemoteException ignored) {}
+                      mCallback = null;
+                  });
+              }
+
+              public void onStatusUpdate(String status) {
+                  Log.d(TAG, "engine: " + status);
+              }
+
+              private void safeError(int errorCode) {
+                  Callback cb = mCallback;
+                  if (cb == null) return;
+                  try { cb.error(errorCode); } catch (RemoteException ignored) {}
+                  mCallback = null;
+              }
+
+              private native void initNative(VoiceRecognitionService service);
+              private native void startListening(VoiceRecognitionService service);
+              private native void feedAudio(short[] samples, int length);
+              private native void stopListening();
+              private native void cancelNative();
+              private native void destroyNative();
+          }
+          JAVA
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/recog_service.rs')
+          s = p.read_text()
+
+          old_capture = '''    // Tell the keyboard we're ready to receive speech.
+              {
+                  let mut env2 = match jvm.attach_current_thread() {
+                      Ok(e) => e,
+                      Err(_) => return,
+                  };
+                  call_void(&mut env2, shared.target.as_obj(), "onReadyForSpeech");
+              }
+
+              // Open the microphone (16 kHz mono, matching the model + voice_session).
+              let host = cpal::default_host();
+              let device = match host.default_input_device() {
+                  Some(d) => d,
+                  None => {
+                      let mut env2 = jvm.attach_current_thread().unwrap();
+                      call_error(&mut env2, shared.target.as_obj(), ERROR_AUDIO);
+                      return;
+                  }
+              };
+              let config = cpal::StreamConfig {
+                  channels: 1,
+                  sample_rate: cpal::SampleRate(16000),
+                  buffer_size: cpal::BufferSize::Default,
+              };
+
+              let cb_shared = shared.clone();
+              let stream = device.build_input_stream(
+                  &config,
+                  move |data: &[f32], _: &_| audio_callback(&cb_shared, data),
+                  |e| log::error!("RecognitionService stream error: {}", e),
+                  None,
+              );
+
+              match stream {
+                  Ok(s) => {
+                      s.play().ok();
+                      *stream_holder.lock().unwrap() = Some(SendStream(s));
+                  }
+                  Err(e) => {
+                      log::error!("Failed to open microphone: {}", e);
+                      let mut env2 = jvm.attach_current_thread().unwrap();
+                      call_error(&mut env2, shared.target.as_obj(), ERROR_AUDIO);
+                      return;
+                  }
+              }
+          '''
+          replacement = '''    // Microphone capture for RecognitionService lives in Java AudioRecord so
+              // Android can attribute it to Callback.getCallingAttributionSource().
+              // PCM is delivered to this same endpoint through feedAudio() below.
+          '''
+          if old_capture not in s:
+              raise SystemExit('native cpal capture block not found')
+          s = s.replace(old_capture, replacement, 1)
+
+          marker = '''/// Called from `onStopListening`: the keyboard asked us to finish now.
+          #[no_mangle]
+          pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService_stopListening(
+          '''
+          feed = '''/// PCM16 from the caller-attributed Java AudioRecord.
+          #[no_mangle]
+          pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService_feedAudio(
+              mut env: JNIEnv,
+              _class: JClass,
+              samples: jni::objects::JShortArray,
+              length: jni::sys::jint,
+          ) {
+              if length <= 0 {
+                  return;
+              }
+              let shared = SESSION
+                  .lock()
+                  .unwrap()
+                  .as_ref()
+                  .map(|s| s.shared.clone());
+              let Some(shared) = shared else {
+                  return;
+              };
+              if shared.finalized.load(Ordering::SeqCst) {
+                  return;
+              }
+
+              let mut pcm = vec![0i16; length as usize];
+              if env.get_short_array_region(&samples, 0, &mut pcm).is_err() {
+                  return;
+              }
+              let audio: Vec<f32> = pcm
+                  .into_iter()
+                  .map(|x| x as f32 / 32768.0)
+                  .collect();
+              audio_callback(&shared, &audio);
+          }
+
+          /// Called from `onStopListening`: the keyboard asked us to finish now.
+          #[no_mangle]
+          pub unsafe extern "system" fn Java_dev_notune_transcribe_VoiceRecognitionService_stopListening(
+          '''
+          if marker not in s:
+              raise SystemExit('stopListening marker not found')
+          s = s.replace(marker, feed, 1)
+          p.write_text(s)
+          PY
+
+      - name: Enable streaming partial results
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          engine = Path('src/engine.rs')
+          s = engine.read_text()
+          old = '''                    let t = std::time::Instant::now();
+                    if let Err(e) = stream.feed(&chunk) {
+                        compute += t.elapsed();
+                        log::error!(
+                            "buffered stream feed failed after {:.1}s audio: {}; falling back to batch",
+                            fallback_audio.len() as f64 / 16_000.0,
+                            e
+                        );
+                        stream.reset();
+                        drop(stream);
+                        return self.transcribe_channel_batch(receiver, fallback_audio);
+                    }
+                    compute += t.elapsed();
+          '''
+          new = '''                    let t = std::time::Instant::now();
+                    let update = match stream.feed(&chunk) {
+                        Ok(update) => update,
+                        Err(e) => {
+                            compute += t.elapsed();
+                            log::error!(
+                                "buffered stream feed failed after {:.1}s audio: {}; falling back to batch",
+                                fallback_audio.len() as f64 / 16_000.0,
+                                e
+                            );
+                            stream.reset();
+                            drop(stream);
+                            return self.transcribe_channel_batch(receiver, fallback_audio);
+                        }
+                    };
+                    compute += t.elapsed();
+                    if update.result_changed {
+                        let partial = stream.text().display();
+                        if !partial.trim().is_empty() {
+                            crate::recog_service::emit_partial(&partial);
+                        }
+                    }
+          '''
+          if old not in s:
+              raise SystemExit('stream feed marker not found')
+          engine.write_text(s.replace(old, new, 1))
+
+          recog = Path('src/recog_service.rs')
+          s = recog.read_text()
+          marker = '''fn call_results(env: &mut JNIEnv, obj: &JObject, text: &str) {
+          '''
+          addition = '''pub(crate) fn emit_partial(text: &str) {
+              let target = {
+                  let guard = SESSION.lock().unwrap();
+                  let Some(session) = guard.as_ref() else { return; };
+                  if session.shared.cancelled.load(Ordering::SeqCst)
+                      || session.shared.finalized.load(Ordering::SeqCst)
+                  {
+                      return;
+                  }
+                  (session.shared.jvm.clone(), session.shared.target.clone())
+              };
+              let (jvm, target) = target;
+              let Ok(mut env) = jvm.attach_current_thread() else { return; };
+              let Ok(jtxt) = env.new_string(text) else { return; };
+              let _ = env.call_method(
+                  target.as_obj(),
+                  "onPartialResults",
+                  "(Ljava/lang/String;)V",
+                  &[(&jtxt).into()],
+              );
+          }
+
+          fn call_results(env: &mut JNIEnv, obj: &JObject, text: &str) {
+          '''
+          if marker not in s:
+              raise SystemExit('call_results marker not found')
+          recog.write_text(s.replace(marker, addition, 1))
+          PY
+
+      - name: Compile Rust and transcribe.cpp for Android
+        env:
+          TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+        run: cargo ndk -t arm64-v8a build --release
+
+      - name: Configure Unified Q4 side-by-side test variant
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          gradle = Path('app/build.gradle.kts')
+          s = gradle.read_text()
+          replacements = {
+              'parakeet-tdt-0.6b-v3-Q4_K_M.gguf': 'parakeet-unified-en-0.6b-Q4_K_M.gguf',
+              'b68557be1e3c40207fd7c4bd9d63f1d3316b963f15325bfb0cc16a8bb0ffd181': 'a8bf3de2b393bd14ead5a858c3748d5e3b07a20fdeabdd3b498fba4f463fa929',
+              'https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/main': 'https://huggingface.co/handy-computer/parakeet-unified-en-0.6b-gguf/resolve/main',
+          }
+          for old, new in replacements.items():
+              if old not in s: raise SystemExit(f'missing expected text: {old}')
+              s = s.replace(old, new)
+          marker = '    buildTypes {\n        release {'
+          replacement = '''    buildTypes {
+                  debug {
+                      applicationIdSuffix = ".unifiedtest"
+                      versionNameSuffix = "-unified-attributed-test"
+                  }
+                  release {'''
+          if marker not in s: raise SystemExit('buildTypes marker missing')
+          gradle.write_text(s.replace(marker, replacement, 1))
+
+          strings = Path('app/src/main/res/values/strings.xml')
+          s = strings.read_text()
+          s = s.replace('<string name="app_name">Offline Voice Input</string>',
+                        '<string name="app_name">Offline Voice Input (Attributed Test)</string>')
+          s = s.replace('<string name="recognition_service_label">Offline Voice Input</string>',
+                        '<string name="recognition_service_label">Offline Voice Input (Attributed Test)</string>')
+          s = s.replace('<string name="models_builtin">Parakeet TDT 0.6B v3</string>',
+                        '<string name="models_builtin">Parakeet Unified EN 0.6B Q4</string>')
+          s = s.replace('<string name="models_builtin_sub">Included in the app · 25 European languages</string>',
+                        '<string name="models_builtin_sub">English · attributed streaming + partials</string>')
+          strings.write_text(s)
+
+          assets = Path('src/assets.rs')
+          s = assets.read_text().replace(
+              'const EXTRACTION_COMPLETE_MARKER: &str = ".extraction_complete";',
+              'const EXTRACTION_COMPLETE_MARKER: &str = ".extraction_complete_unified_q4_attributed_v1";')
+          assets.write_text(s)
+          PY
+
+      - name: Build debug APK
+        run: ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:assembleDebug --stacktrace
+
+      - name: Upload attributed Unified test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-voice-input-unified-attributed-streaming-partials
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

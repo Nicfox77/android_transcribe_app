@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod audio;
 pub mod engine;
+pub mod heliboard;
 pub mod ime;
 pub mod main_activity;
 pub mod models;

@@ -1,0 +1,9 @@
+run_id=32776964972
+source_sha=c37a624d3b43abd1011397d75044cb9291e72a07
+native_outcome=success
+configure_outcome=success
+apk_outcome=success
+stage_outcome=success
+upload_outcome=success
+artifact=offline-voice-input-unified-streaming-final-fix
+apk=Offline-Voice-Input-Unified-Streaming-final-fix.apk

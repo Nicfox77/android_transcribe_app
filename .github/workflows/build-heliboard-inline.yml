@@ -1,14 +1,16 @@
-name: Build Android App
+name: Build streaming IME final fix APK
 
 on:
   push:
     branches:
       - feature/parakeet-unified-streaming
-    paths-ignore:
-      - 'build_status/**'
-  pull_request:
-    branches:
-      - main
+    paths:
+      - 'src/**'
+      - 'app/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.github/workflows/build-heliboard-inline.yml'
   workflow_dispatch:
 
 permissions:
@@ -18,19 +20,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout streaming branch
+      - name: Checkout streaming feature branch
         uses: actions/checkout@v4
         with:
           ref: feature/parakeet-unified-streaming
 
-      - name: Set up JDK 17
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
           distribution: temurin
-
-      - name: Fix gradle.properties for CI
-        run: sed -i '/org.gradle.java.home/d' gradle.properties
+          java-version: '17'
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
@@ -53,7 +52,7 @@ jobs:
           sudo apt-get install -y cmake ninja-build
           cargo install cargo-ndk
 
-      - name: Compile native code
+      - name: Compile native streaming code
         id: native
         continue-on-error: true
         env:
@@ -62,7 +61,7 @@ jobs:
           set -o pipefail
           cargo ndk -t arm64-v8a build --release 2>&1 | tee native-build.log
 
-      - name: Configure Unified Q4 test APK
+      - name: Configure Unified Q4 standalone test variant
         id: configure
         if: steps.native.outcome == 'success'
         continue-on-error: true
@@ -109,12 +108,12 @@ jobs:
           )
           s = s.replace(
               '<string name="models_builtin_sub">Included in the app · 25 European languages</string>',
-              '<string name="models_builtin_sub">English · streaming final-text fallback</string>',
+              '<string name="models_builtin_sub">English · buffered streaming final-text fallback</string>',
           )
           strings.write_text(s)
           PY
 
-      - name: Build debug APK
+      - name: Build standalone streaming APK
         id: apk
         if: steps.native.outcome == 'success' && steps.configure.outcome == 'success'
         continue-on-error: true
@@ -167,9 +166,9 @@ jobs:
           } > build_status/streaming-ime-result.txt
           {
             echo "===== native build tail ====="
-            tail -n 180 native-build.log 2>/dev/null || true
+            tail -n 160 native-build.log 2>/dev/null || true
             echo "===== APK build tail ====="
-            tail -n 180 apk-build.log 2>/dev/null || true
+            tail -n 160 apk-build.log 2>/dev/null || true
           } > build_status/streaming-ime-build-tail.log
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
