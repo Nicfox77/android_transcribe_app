@@ -65,6 +65,82 @@ jobs:
           gradle.write_text(s.replace(marker, replacement, 1))
           PY
 
+      - name: Patch empty streaming final fallback
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/engine.rs')
+          s = p.read_text()
+          old = '''                        Ok(update) => {
+                            let finalize_elapsed = finalize_started.elapsed();
+                            let text = stream.text().full;
+                            let audio_secs = fallback_audio.len() as f64 / 16_000.0;
+                            let compute_secs = compute.as_secs_f64();
+                            let rtf = if audio_secs > 0.0 {
+                                compute_secs / audio_secs
+                            } else {
+                                0.0
+                            };
+                            log::info!(
+                                "buffered streaming: {:.1}s audio, feed compute {:.2}s (RTF {:.2}), finalize {:.2}s, wall {:.2}s, buffered {}ms",
+                                audio_secs,
+                                compute_secs,
+                                rtf,
+                                finalize_elapsed.as_secs_f64(),
+                                started.elapsed().as_secs_f64(),
+                                update.buffered_ms
+                            );
+                            return Ok(Some(text));
+                        }
+'''
+          new = '''                        Ok(update) => {
+                            let finalize_elapsed = finalize_started.elapsed();
+                            let snapshot = stream.text();
+                            // Some streaming families populate the committed/tentative
+                            // snapshot even when full_text is empty after finalize.
+                            // Prefer the authoritative full hypothesis, then the UI
+                            // display snapshot. Never silently return an empty result:
+                            // retained PCM lets us fall back to the proven batch path.
+                            let text = if !snapshot.full.trim().is_empty() {
+                                snapshot.full.clone()
+                            } else {
+                                snapshot.display()
+                            };
+                            let audio_secs = fallback_audio.len() as f64 / 16_000.0;
+                            let compute_secs = compute.as_secs_f64();
+                            let rtf = if audio_secs > 0.0 {
+                                compute_secs / audio_secs
+                            } else {
+                                0.0
+                            };
+                            log::info!(
+                                "buffered streaming: {:.1}s audio, feed compute {:.2}s (RTF {:.2}), finalize {:.2}s, wall {:.2}s, buffered {}ms, full={} chars, committed={} chars, tentative={} chars",
+                                audio_secs,
+                                compute_secs,
+                                rtf,
+                                finalize_elapsed.as_secs_f64(),
+                                started.elapsed().as_secs_f64(),
+                                update.buffered_ms,
+                                snapshot.full.len(),
+                                snapshot.committed.len(),
+                                snapshot.tentative.len()
+                            );
+                            if text.trim().is_empty() && !fallback_audio.is_empty() {
+                                log::warn!(
+                                    "buffered stream finalized with empty text; falling back to batch"
+                                );
+                                stream.reset();
+                                drop(stream);
+                                return self.transcribe(fallback_audio).map(Some);
+                            }
+                            return Ok(Some(text));
+                        }
+'''
+          if old not in s:
+              raise SystemExit('expected streaming finalize block not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
       - name: Build ARM64 debug APK
         env:
           TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
@@ -75,15 +151,15 @@ jobs:
           mkdir -p dist
           APK=$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -print -quit)
           test -n "$APK"
-          cp "$APK" dist/Offline-Voice-Input-Unified-Streaming-dev.apk
-          sha256sum dist/Offline-Voice-Input-Unified-Streaming-dev.apk > dist/Offline-Voice-Input-Unified-Streaming-dev.apk.sha256
+          cp "$APK" dist/Offline-Voice-Input-Unified-Streaming-empty-final-fix.apk
+          sha256sum dist/Offline-Voice-Input-Unified-Streaming-empty-final-fix.apk > dist/Offline-Voice-Input-Unified-Streaming-empty-final-fix.apk.sha256
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: offline-voice-input-unified-streaming-dev
+          name: offline-voice-input-unified-streaming-empty-final-fix
           path: |
-            dist/Offline-Voice-Input-Unified-Streaming-dev.apk
-            dist/Offline-Voice-Input-Unified-Streaming-dev.apk.sha256
+            dist/Offline-Voice-Input-Unified-Streaming-empty-final-fix.apk
+            dist/Offline-Voice-Input-Unified-Streaming-empty-final-fix.apk.sha256
           compression-level: 0
           retention-days: 14
