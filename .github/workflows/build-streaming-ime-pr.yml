@@ -1,17 +1,31 @@
 name: Build streaming IME APK
 
 on:
-  pull_request:
+  push:
     branches:
       - main
+    paths:
+      - '.github/workflows/build-streaming-ime-pr.yml'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout PR code
+      - name: Checkout reporter branch
         uses: actions/checkout@v4
+        with:
+          ref: main
+          path: reporter
+
+      - name: Checkout streaming feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/parakeet-unified-streaming
+          path: appsrc
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -41,6 +55,7 @@ jobs:
           cargo install cargo-ndk
 
       - name: Configure Unified Q4 test variant
+        working-directory: appsrc
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -68,12 +83,12 @@ jobs:
           PY
 
       - name: Apply final-text fallback
+        working-directory: appsrc
         run: |
           python3 - <<'PY'
           from pathlib import Path
           p = Path('src/engine.rs')
           s = p.read_text()
-
           needle = '                            let text = stream.text().full;\n'
           replacement = '''                            let snapshot = stream.text();
                             let text = if !snapshot.full.trim().is_empty() {
@@ -85,7 +100,6 @@ jobs:
           if s.count(needle) != 1:
               raise SystemExit(f'expected one final-text line, found {s.count(needle)}')
           s = s.replace(needle, replacement, 1)
-
           needle = '                            return Ok(Some(text));\n'
           replacement = '''                            if text.trim().is_empty() && !fallback_audio.is_empty() {
                                 log::warn!("buffered stream finalized empty; retrying retained PCM in batch mode");
@@ -100,11 +114,24 @@ jobs:
           PY
 
       - name: Build ARM64 debug APK
+        id: compile
+        continue-on-error: true
+        working-directory: appsrc
         env:
           TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
-        run: ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:assembleDebug --stacktrace
+        run: |
+          set +e
+          ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:assembleDebug --stacktrace > ../reporter/streaming-ime-build.log 2>&1
+          rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          tail -n 250 ../reporter/streaming-ime-build.log
+          exit "$rc"
 
       - name: Stage APK
+        id: stage
+        if: steps.compile.outcome == 'success'
+        continue-on-error: true
+        working-directory: appsrc
         run: |
           mkdir -p dist
           APK=$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -print -quit)
@@ -113,11 +140,41 @@ jobs:
           sha256sum dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk > dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk.sha256
 
       - name: Upload APK artifact
+        id: upload
+        if: steps.compile.outcome == 'success' && steps.stage.outcome == 'success'
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: offline-voice-input-unified-streaming-final-fix
           path: |
-            dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk
-            dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk.sha256
+            appsrc/dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk
+            appsrc/dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk.sha256
           compression-level: 0
           retention-days: 14
+
+      - name: Record build result and log
+        if: always()
+        working-directory: reporter
+        run: |
+          mkdir -p build_status
+          cp streaming-ime-build.log build_status/streaming-ime-build.log 2>/dev/null || true
+          cat > build_status/streaming-ime-result.txt <<EOF
+          source_branch=feature/parakeet-unified-streaming
+          source_sha=$(git -C ../appsrc rev-parse HEAD)
+          run_id=$GITHUB_RUN_ID
+          compile_outcome=${{ steps.compile.outcome }}
+          compile_exit_code=${{ steps.compile.outputs.exit_code }}
+          stage_outcome=${{ steps.stage.outcome }}
+          upload_outcome=${{ steps.upload.outcome }}
+          artifact=offline-voice-input-unified-streaming-final-fix
+          apk=Offline-Voice-Input-Unified-Streaming-final-fix.apk
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build_status/streaming-ime-result.txt build_status/streaming-ime-build.log || true
+          git commit -m "Record streaming IME build $GITHUB_RUN_ID" || exit 0
+          git push origin HEAD:main
+
+      - name: Fail if APK was not uploaded
+        if: steps.compile.outcome != 'success' || steps.stage.outcome != 'success' || steps.upload.outcome != 'success'
+        run: exit 1
