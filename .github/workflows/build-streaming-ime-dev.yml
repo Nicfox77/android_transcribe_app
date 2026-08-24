@@ -162,6 +162,22 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+      - name: Record successful APK build
+        continue-on-error: true
+        run: |
+          mkdir -p build_status
+          cat > build_status/streaming-ime-final-fix.txt <<EOF
+          run_id=$GITHUB_RUN_ID
+          source_commit=$GITHUB_SHA
+          artifact=offline-voice-input-unified-streaming-final-fix
+          apk=Offline-Voice-Input-Unified-Streaming-final-fix.apk
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build_status/streaming-ime-final-fix.txt
+          git commit -m "Record successful streaming IME APK build $GITHUB_RUN_ID" || exit 0
+          git push origin HEAD:feature/parakeet-unified-streaming
+
       - name: Publish direct dev APK release
         continue-on-error: true
         env:
