@@ -1,6 +1,12 @@
 name: Build standalone streaming IME APK
 
 on:
+  push:
+    branches:
+      - feature/parakeet-unified-streaming
+    paths:
+      - 'src/**'
+      - '.github/workflows/build-streaming-ime-visible.yml'
   pull_request:
   workflow_dispatch:
 
@@ -96,11 +102,6 @@ jobs:
           new = '''                        Ok(update) => {
                             let finalize_elapsed = finalize_started.elapsed();
                             let snapshot = stream.text();
-                            // Some streaming families populate the committed/tentative
-                            // snapshot even when full_text is empty after finalize.
-                            // Prefer the authoritative full hypothesis, then the UI
-                            // display snapshot. Never silently return an empty result:
-                            // retained PCM lets us fall back to the proven batch path.
                             let text = if !snapshot.full.trim().is_empty() {
                                 snapshot.full.clone()
                             } else {
@@ -126,9 +127,7 @@ jobs:
                                 snapshot.tentative.len()
                             );
                             if text.trim().is_empty() && !fallback_audio.is_empty() {
-                                log::warn!(
-                                    "buffered stream finalized with empty text; falling back to batch"
-                                );
+                                log::warn!("buffered stream finalized with empty text; falling back to batch");
                                 stream.reset();
                                 drop(stream);
                                 return self.transcribe(fallback_audio).map(Some);
