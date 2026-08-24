@@ -6,6 +6,9 @@ on:
       - feature/parakeet-unified-streaming
     paths-ignore:
       - 'build_status/**'
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
