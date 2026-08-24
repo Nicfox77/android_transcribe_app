@@ -1,0 +1,132 @@
+name: Build streaming IME final fix APK
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout streaming feature branch
+        uses: actions/checkout@v4
+        with:
+          repository: Nicfox77/android_transcribe_app
+          ref: feature/parakeet-unified-streaming
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "ndk;28.0.13004108"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          cargo install cargo-ndk
+
+      - name: Configure Parakeet Unified Q4 test variant
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          gradle = Path('app/build.gradle.kts')
+          s = gradle.read_text()
+          replacements = {
+              'parakeet-tdt-0.6b-v3-Q4_K_M.gguf': 'parakeet-unified-en-0.6b-Q4_K_M.gguf',
+              'b68557be1e3c40207fd7c4bd9d63f1d3316b963f15325bfb0cc16a8bb0ffd181': 'a8bf3de2b393bd14ead5a858c3748d5e3b07a20fdeabdd3b498fba4f463fa929',
+              'https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/main': 'https://huggingface.co/handy-computer/parakeet-unified-en-0.6b-gguf/resolve/main',
+          }
+          for old, new in replacements.items():
+              if old not in s:
+                  raise SystemExit(f'missing expected model config: {old}')
+              s = s.replace(old, new)
+
+          marker = '    buildTypes {\n        release {'
+          replacement = '''    buildTypes {
+                  debug {
+                      applicationIdSuffix = ".streamingtest"
+                      versionNameSuffix = "-unified-streaming-final-fix"
+                  }
+                  release {'''
+          if marker not in s:
+              raise SystemExit('buildTypes marker missing')
+          gradle.write_text(s.replace(marker, replacement, 1))
+          PY
+
+      - name: Patch streaming final-text fallback
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/engine.rs')
+          s = p.read_text()
+
+          old_text = '                            let text = stream.text().full;\n'
+          new_text = '''                            let snapshot = stream.text();
+                            let text = if !snapshot.full.trim().is_empty() {
+                                snapshot.full.clone()
+                            } else {
+                                snapshot.display()
+                            };
+'''
+          if s.count(old_text) != 1:
+              raise SystemExit(f'expected exactly one stream final text line, found {s.count(old_text)}')
+          s = s.replace(old_text, new_text, 1)
+
+          old_return = '''                            return Ok(Some(text));
+                        }
+                        Err(e) => {
+'''
+          new_return = '''                            if text.trim().is_empty() && !fallback_audio.is_empty() {
+                                log::warn!("buffered stream finalized with empty text; falling back to retained PCM batch transcription");
+                                drop(stream);
+                                return self.transcribe(fallback_audio).map(Some);
+                            }
+                            return Ok(Some(text));
+                        }
+                        Err(e) => {
+'''
+          if s.count(old_return) != 1:
+              raise SystemExit(f'expected exactly one stream final return block, found {s.count(old_return)}')
+          p.write_text(s.replace(old_return, new_return, 1))
+          PY
+
+      - name: Build ARM64 debug APK
+        env:
+          TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+        run: ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:assembleDebug --stacktrace
+
+      - name: Stage APK
+        run: |
+          mkdir -p dist
+          APK=$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -print -quit)
+          test -n "$APK"
+          cp "$APK" dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk
+          sha256sum dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk > dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk.sha256
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-voice-input-unified-streaming-final-fix
+          path: |
+            dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk
+            dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk.sha256
+          compression-level: 0
+          retention-days: 14
