@@ -72,7 +72,7 @@ jobs:
           replacement = '''    buildTypes {
                   debug {
                       applicationIdSuffix = ".streamingtest"
-                      versionNameSuffix = "-unified-streaming-test"
+                      versionNameSuffix = "-unified-streaming-final-fix"
                   }
                   release {'''
           if marker not in s:
@@ -83,11 +83,11 @@ jobs:
           s = strings.read_text()
           s = s.replace(
               '<string name="app_name">Offline Voice Input</string>',
-              '<string name="app_name">Offline Voice Input (Streaming)</string>',
+              '<string name="app_name">Offline Voice Input (Streaming Final Fix)</string>',
           )
           s = s.replace(
               '<string name="recognition_service_label">Offline Voice Input</string>',
-              '<string name="recognition_service_label">Offline Voice Input (Streaming)</string>',
+              '<string name="recognition_service_label">Offline Voice Input (Streaming Final Fix)</string>',
           )
           s = s.replace(
               '<string name="models_builtin">Parakeet TDT 0.6B v3</string>',
@@ -95,9 +95,47 @@ jobs:
           )
           s = s.replace(
               '<string name="models_builtin_sub">Included in the app · 25 European languages</string>',
-              '<string name="models_builtin_sub">English · buffered streaming while recording</string>',
+              '<string name="models_builtin_sub">English · streaming with final-text fallback</string>',
           )
           strings.write_text(s)
+          PY
+
+      - name: Patch streaming final-text fallback
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/engine.rs')
+          s = p.read_text()
+
+          old_text = '                            let text = stream.text().full;\n'
+          new_text = '''                            let snapshot = stream.text();
+                            let text = if !snapshot.full.trim().is_empty() {
+                                snapshot.full.clone()
+                            } else {
+                                snapshot.display()
+                            };
+'''
+          if s.count(old_text) != 1:
+              raise SystemExit(f'expected exactly one stream final text line, found {s.count(old_text)}')
+          s = s.replace(old_text, new_text, 1)
+
+          old_return = '''                            return Ok(Some(text));
+                        }
+                        Err(e) => {
+'''
+          new_return = '''                            if text.trim().is_empty() && !fallback_audio.is_empty() {
+                                log::warn!("buffered stream finalized with empty text; falling back to retained PCM batch transcription");
+                                drop(stream);
+                                return self.transcribe(fallback_audio).map(Some);
+                            }
+                            return Ok(Some(text));
+                        }
+                        Err(e) => {
+'''
+          if s.count(old_return) != 1:
+              raise SystemExit(f'expected exactly one stream final return block, found {s.count(old_return)}')
+          p.write_text(s.replace(old_return, new_return, 1))
           PY
 
       - name: Build ARM64 debug APK
@@ -105,26 +143,27 @@ jobs:
           TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
         run: ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:assembleDebug --stacktrace
 
-      - name: Prepare direct APK asset
+      - name: Prepare APK artifact
         run: |
           mkdir -p dist
           APK=$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -print -quit)
           test -n "$APK"
-          cp "$APK" dist/Offline-Voice-Input-Unified-Streaming-dev.apk
-          sha256sum dist/Offline-Voice-Input-Unified-Streaming-dev.apk \
-            | tee dist/Offline-Voice-Input-Unified-Streaming-dev.apk.sha256
+          cp "$APK" dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk
+          sha256sum dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk \
+            | tee dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk.sha256
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: offline-voice-input-unified-streaming-dev
+          name: offline-voice-input-unified-streaming-final-fix
           path: |
-            dist/Offline-Voice-Input-Unified-Streaming-dev.apk
-            dist/Offline-Voice-Input-Unified-Streaming-dev.apk.sha256
+            dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk
+            dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk.sha256
           compression-level: 0
           retention-days: 14
 
       - name: Publish direct dev APK release
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -133,10 +172,10 @@ jobs:
               --target "$GITHUB_SHA" \
               --title "Offline Voice Input - Unified streaming dev" \
               --prerelease \
-              --notes "ARM64 test build using Parakeet Unified EN 0.6B Q4. The dedicated voice keyboard and voice-input activity feed microphone audio into inference continuously; Stop only finalizes the already-running stream."
+              --notes "ARM64 Parakeet Unified streaming development build."
           fi
 
           gh release upload streaming-ime-dev \
-            dist/Offline-Voice-Input-Unified-Streaming-dev.apk \
-            dist/Offline-Voice-Input-Unified-Streaming-dev.apk.sha256 \
+            dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk \
+            dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk.sha256 \
             --clobber
