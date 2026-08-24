@@ -12,6 +12,7 @@ on:
       - 'Cargo.lock'
       - 'build.rs'
       - '.github/workflows/build-streaming-ime-dev.yml'
+  pull_request:
   workflow_dispatch:
 
 permissions:
