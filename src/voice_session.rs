@@ -18,6 +18,15 @@ const AUTO_STOP_SILENCE_MS: u64 = 2000;
 /// If no speech is ever detected, auto-stop after this long.
 const AUTO_STOP_NO_SPEECH_MS: u64 = 8000;
 
+// Parakeet Unified's native buffered-stream mode repeatedly re-encodes a large
+// left-context window for every small streaming step. That is useful for true
+// incremental hypotheses, but on phone CPUs it can be far slower than the
+// model's excellent one-shot benchmark speed. For keyboard dictation we instead
+// pre-decode speech continuously in short offline chunks while recording. At
+// Stop only the small unprocessed tail remains.
+const ROLLING_TARGET_SAMPLES: usize = 5 * 16_000;
+const ROLLING_SPLIT_SEARCH_START_SAMPLES: usize = 3 * 16_000;
+
 pub struct SendStream(#[allow(dead_code)] pub cpal::Stream);
 unsafe impl Send for SendStream {}
 unsafe impl Sync for SendStream {}
@@ -40,9 +49,8 @@ pub struct VoiceSessionState {
     /// forwarding PCM.
     pub session_active: Arc<AtomicBool>,
     /// Live microphone -> inference-worker channel for the current recording.
-    /// Unified consumes this continuously; non-streaming models collect it in
-    /// the engine worker and retain their previous record-then-transcribe
-    /// semantics.
+    /// The keyboard worker consumes this continuously and pre-decodes short
+    /// chunks before Stop instead of retaining the whole recording.
     pub input_tx: Option<crossbeam_channel::Sender<engine::RecognitionInput>>,
     /// Number of samples forwarded in the current recording. Used only to
     /// reject an empty/failed microphone session before finalization.
@@ -90,6 +98,108 @@ fn notify_text(env: &mut JNIEnv, obj: &JObject, text: &str) {
     }
 }
 
+fn append_transcript_piece(full: &mut String, piece: &str) {
+    let piece = piece.trim();
+    if piece.is_empty() {
+        return;
+    }
+    if !full.is_empty() {
+        full.push(' ');
+    }
+    full.push_str(piece);
+}
+
+/// Keep the fast offline engine busy *during* microphone capture. Once about
+/// five seconds of PCM are buffered, choose the quietest split between 3-5 s,
+/// transcribe that prefix, and continue collecting the tail. Because offline
+/// inference is several times faster than realtime on the target phone, this
+/// worker should stay ahead of the microphone and leave <5 s to process after
+/// Stop. Quiet-point splitting avoids most word-boundary artifacts without the
+/// repeated 5.6 s left-context cost of Unified's native buffered stream.
+fn transcribe_rolling_predecode(
+    eng_arc: &Arc<Mutex<engine::Engine>>,
+    input_rx: &crossbeam_channel::Receiver<engine::RecognitionInput>,
+) -> Result<Option<String>, String> {
+    let started = Instant::now();
+    let mut pending = Vec::<f32>::with_capacity(ROLLING_TARGET_SAMPLES + 16_000);
+    let mut text = String::new();
+    let mut total_samples = 0usize;
+    let mut decoded_samples = 0usize;
+    let mut decode_compute = Duration::ZERO;
+    let mut segments = 0usize;
+
+    loop {
+        match input_rx.recv() {
+            Ok(engine::RecognitionInput::Audio(chunk)) => {
+                total_samples += chunk.len();
+                pending.extend_from_slice(&chunk);
+
+                while pending.len() >= ROLLING_TARGET_SAMPLES {
+                    let split = crate::audio::find_quietest_split(
+                        &pending,
+                        ROLLING_SPLIT_SEARCH_START_SAMPLES,
+                        ROLLING_TARGET_SAMPLES,
+                    )
+                    .clamp(1, pending.len());
+
+                    let tail = pending.split_off(split);
+                    let piece_audio = std::mem::replace(&mut pending, tail);
+                    let piece_samples = piece_audio.len();
+                    let decode_started = Instant::now();
+                    let piece_text = engine::transcribe_shared(eng_arc, piece_audio)?;
+                    let elapsed = decode_started.elapsed();
+
+                    decode_compute += elapsed;
+                    decoded_samples += piece_samples;
+                    segments += 1;
+                    append_transcript_piece(&mut text, &piece_text);
+
+                    log::info!(
+                        "voice rolling predecode: segment {} = {:.2}s audio in {:.2}s; {:.2}s PCM retained",
+                        segments,
+                        piece_samples as f64 / 16_000.0,
+                        elapsed.as_secs_f64(),
+                        pending.len() as f64 / 16_000.0,
+                    );
+                }
+            }
+            Ok(engine::RecognitionInput::Finish) => {
+                let finalize_started = Instant::now();
+                if !pending.is_empty() {
+                    let piece_samples = pending.len();
+                    let piece_audio = std::mem::take(&mut pending);
+                    let decode_started = Instant::now();
+                    let piece_text = engine::transcribe_shared(eng_arc, piece_audio)?;
+                    let elapsed = decode_started.elapsed();
+                    decode_compute += elapsed;
+                    decoded_samples += piece_samples;
+                    segments += 1;
+                    append_transcript_piece(&mut text, &piece_text);
+                }
+
+                let audio_secs = total_samples as f64 / 16_000.0;
+                let compute_secs = decode_compute.as_secs_f64();
+                let speed = if compute_secs > 0.0 {
+                    decoded_samples as f64 / 16_000.0 / compute_secs
+                } else {
+                    0.0
+                };
+                log::info!(
+                    "voice rolling predecode complete: {:.2}s audio, {} segments, {:.2}s total decode ({:.2}x realtime), Stop tail {:.2}s, wall {:.2}s",
+                    audio_secs,
+                    segments,
+                    compute_secs,
+                    speed,
+                    finalize_started.elapsed().as_secs_f64(),
+                    started.elapsed().as_secs_f64(),
+                );
+                return Ok(Some(text));
+            }
+            Ok(engine::RecognitionInput::Cancel) | Err(_) => return Ok(None),
+        }
+    }
+}
+
 pub fn init_session(env: JNIEnv, target: JObject) -> VoiceSessionState {
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
@@ -122,9 +232,10 @@ pub fn init_session(env: JNIEnv, target: JObject) -> VoiceSessionState {
 }
 
 /// Begin microphone capture and start the model worker immediately. Microphone
-/// PCM is sent to the worker as it arrives, so streaming-capable models perform
-/// inference while the user is still speaking. `stop_recording()` therefore
-/// only has to send `Finish` and wait for the stream's small finalization tail.
+/// PCM is sent to the worker as it arrives. The keyboard path uses rolling
+/// one-shot decoding while recording so it can exploit Parakeet Unified's fast
+/// offline throughput without the high repeated-context cost of native buffered
+/// streaming. `stop_recording()` therefore only leaves a short tail to decode.
 ///
 /// With `auto_stop` set, a monitor thread watches for trailing silence after
 /// speech (or a no-speech timeout) and invokes the Java-side `onAutoStop()`
@@ -144,8 +255,8 @@ pub fn start_recording(mut env: JNIEnv, state: &mut VoiceSessionState, auto_stop
     state.input_tx = Some(input_tx.clone());
 
     // Start inference before opening the microphone. If model warm-up is still
-    // in progress, PCM simply queues in this unbounded channel and Unified
-    // catches up as soon as loading completes.
+    // in progress, PCM simply queues in this unbounded channel and the rolling
+    // decoder catches up as soon as loading completes.
     let worker_jvm = state.jvm.clone();
     let worker_target = state.target_ref.clone();
     let worker_generation = state.session_generation.clone();
@@ -157,7 +268,7 @@ pub fn start_recording(mut env: JNIEnv, state: &mut VoiceSessionState, auto_stop
         }
 
         let result = match engine::get_engine() {
-            Some(eng_arc) => engine::transcribe_recognition_shared(&eng_arc, &input_rx),
+            Some(eng_arc) => transcribe_rolling_predecode(&eng_arc, &input_rx),
             None => Err("model unavailable after load".to_string()),
         };
 
@@ -355,9 +466,9 @@ pub fn stop_recording(mut env: JNIEnv, state: &mut VoiceSessionState) {
         return;
     }
 
-    // The worker has been consuming microphone chunks throughout the session.
-    // For Parakeet Unified this is a stream finalize, not a full post-recording
-    // transcription. Non-streaming models still batch internally in engine.rs.
+    // Most of the recording has already been transcribed in rolling chunks.
+    // Finish asks the worker to decode only the retained (<5 s) tail and join
+    // it with the text produced while the microphone was active.
     notify_status(&mut env, state.target_ref.as_obj(), "Finalizing...");
     match state.input_tx.take() {
         Some(tx) => {
