@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - '.github/workflows/build-streaming-ime-pr.yml'
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
