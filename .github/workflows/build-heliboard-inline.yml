@@ -1,152 +1,23 @@
-name: Build HeliBoard inline voice APK
+name: Build streaming IME final fix APK
 
 on:
-  pull_request:
+  push:
+    branches:
+      - feature/parakeet-unified-streaming
+    paths:
+      - 'src/**'
+      - 'app/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.github/workflows/build-heliboard-inline.yml'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout HeliBoard inline voice branch
-        uses: actions/checkout@v4
-        with:
-          repository: Nicfox77/HeliBoard
-          ref: 5007b5717582b4aef7bc3a79db84d4706a950d71
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: temurin
-
-      - uses: gradle/actions/setup-gradle@v3
-
-      - name: Limit test APK to arm64
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('app/build.gradle.kts')
-          s = p.read_text()
-          old = 'abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))'
-          new = 'abiFilters.add("arm64-v8a")'
-          if old not in s:
-              raise SystemExit('expected abiFilters declaration not found')
-          p.write_text(s.replace(old, new, 1))
-          PY
-
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
-
-      - name: Build HeliBoard debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
-
-      - name: Upload HeliBoard inline voice APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: HeliBoard-inline-voice-caller-audio-arm64
-          path: app/build/outputs/apk/debug/*-debug*.apk
-          if-no-files-found: error
-          retention-days: 14
-
-  attributed-service:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout speech service feature branch
-        uses: actions/checkout@v4
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK
-        run: |
-          sdkmanager --install "ndk;28.0.13004108"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
-
-      - name: Install native build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
-          cargo install cargo-ndk
-
-      - name: Compile RecognitionService native code
-        env:
-          TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
-        run: cargo ndk -t arm64-v8a build --release
-
-      - name: Configure Unified Q4 side-by-side test variant
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          gradle = Path('app/build.gradle.kts')
-          s = gradle.read_text()
-          replacements = {
-              'parakeet-tdt-0.6b-v3-Q4_K_M.gguf': 'parakeet-unified-en-0.6b-Q4_K_M.gguf',
-              'b68557be1e3c40207fd7c4bd9d63f1d3316b963f15325bfb0cc16a8bb0ffd181': 'a8bf3de2b393bd14ead5a858c3748d5e3b07a20fdeabdd3b498fba4f463fa929',
-              'https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/main': 'https://huggingface.co/handy-computer/parakeet-unified-en-0.6b-gguf/resolve/main',
-          }
-          for old, new in replacements.items():
-              if old not in s:
-                  raise SystemExit(f'missing expected build.gradle text: {old}')
-              s = s.replace(old, new)
-
-          marker = '    buildTypes {\n        release {'
-          replacement = '''    buildTypes {
-                  debug {
-                      applicationIdSuffix = ".unifiedtest"
-                      versionNameSuffix = "-unified-caller-audio-test"
-                  }
-                  release {'''
-          if marker not in s:
-              raise SystemExit('missing expected buildTypes block')
-          gradle.write_text(s.replace(marker, replacement, 1))
-
-          strings = Path('app/src/main/res/values/strings.xml')
-          s = strings.read_text()
-          s = s.replace('<string name="app_name">Offline Voice Input</string>',
-                        '<string name="app_name">Offline Voice Input (Caller Audio Test)</string>')
-          s = s.replace('<string name="recognition_service_label">Offline Voice Input</string>',
-                        '<string name="recognition_service_label">Offline Voice Input (Caller Audio Test)</string>')
-          s = s.replace('<string name="models_builtin">Parakeet TDT 0.6B v3</string>',
-                        '<string name="models_builtin">Parakeet Unified EN 0.6B Q4</string>')
-          s = s.replace('<string name="models_builtin_sub">Included in the app · 25 European languages</string>',
-                        '<string name="models_builtin_sub">English · caller PCM streaming</string>')
-          strings.write_text(s)
-
-          assets = Path('src/assets.rs')
-          s = assets.read_text().replace(
-              'const EXTRACTION_COMPLETE_MARKER: &str = ".extraction_complete";',
-              'const EXTRACTION_COMPLETE_MARKER: &str = ".extraction_complete_unified_q4_caller_audio_v1";')
-          assets.write_text(s)
-          PY
-
-      - name: Build Unified caller-audio debug APK
-        run: ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:assembleDebug --stacktrace
-
-      - name: Upload Unified caller-audio test APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: offline-voice-input-unified-caller-audio-streaming
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
-
-  streaming-ime-final-fix:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout streaming feature branch
@@ -181,51 +52,23 @@ jobs:
           sudo apt-get install -y cmake ninja-build
           cargo install cargo-ndk
 
-      - name: Apply final-text fallback
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('src/engine.rs')
-          s = p.read_text()
-
-          old = '                            let text = stream.text().full;\n'
-          new = '''                            let snapshot = stream.text();
-                            let text = if !snapshot.full.trim().is_empty() {
-                                snapshot.full.clone()
-                            } else if !snapshot.committed.trim().is_empty()
-                                || !snapshot.tentative.trim().is_empty()
-                            {
-                                format!("{}{}", snapshot.committed, snapshot.tentative)
-                            } else {
-                                String::new()
-                            };
-'''
-          if s.count(old) != 1:
-              raise SystemExit(f'expected one final stream text line, found {s.count(old)}')
-          s = s.replace(old, new, 1)
-
-          old = '                            return Ok(Some(text));\n'
-          new = '''                            if text.trim().is_empty() && !fallback_audio.is_empty() {
-                                log::warn!("buffered stream finalized empty; retrying retained PCM in batch mode");
-                                drop(stream);
-                                return self.transcribe(fallback_audio).map(Some);
-                            }
-                            return Ok(Some(text));
-'''
-          if s.count(old) != 1:
-              raise SystemExit(f'expected one final return, found {s.count(old)}')
-          p.write_text(s.replace(old, new, 1))
-          PY
-
-      - name: Compile patched native code
+      - name: Compile native streaming code
+        id: native
+        continue-on-error: true
         env:
           TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
-        run: cargo ndk -t arm64-v8a build --release
+        run: |
+          set -o pipefail
+          cargo ndk -t arm64-v8a build --release 2>&1 | tee native-build.log
 
       - name: Configure Unified Q4 standalone test variant
+        id: configure
+        if: steps.native.outcome == 'success'
+        continue-on-error: true
         run: |
           python3 - <<'PY'
           from pathlib import Path
+
           gradle = Path('app/build.gradle.kts')
           s = gradle.read_text()
           replacements = {
@@ -237,6 +80,7 @@ jobs:
               if old not in s:
                   raise SystemExit(f'missing expected model config: {old}')
               s = s.replace(old, new)
+
           marker = '    buildTypes {\n        release {'
           replacement = '''    buildTypes {
                   debug {
@@ -247,22 +91,54 @@ jobs:
           if marker not in s:
               raise SystemExit('missing expected buildTypes block')
           gradle.write_text(s.replace(marker, replacement, 1))
+
+          strings = Path('app/src/main/res/values/strings.xml')
+          s = strings.read_text()
+          s = s.replace(
+              '<string name="app_name">Offline Voice Input</string>',
+              '<string name="app_name">Offline Voice Input (Streaming Final Fix)</string>',
+          )
+          s = s.replace(
+              '<string name="recognition_service_label">Offline Voice Input</string>',
+              '<string name="recognition_service_label">Offline Voice Input (Streaming Final Fix)</string>',
+          )
+          s = s.replace(
+              '<string name="models_builtin">Parakeet TDT 0.6B v3</string>',
+              '<string name="models_builtin">Parakeet Unified EN 0.6B Q4</string>',
+          )
+          s = s.replace(
+              '<string name="models_builtin_sub">Included in the app · 25 European languages</string>',
+              '<string name="models_builtin_sub">English · buffered streaming final-text fallback</string>',
+          )
+          strings.write_text(s)
           PY
 
-      - name: Build standalone streaming debug APK
+      - name: Build standalone streaming APK
+        id: apk
+        if: steps.native.outcome == 'success' && steps.configure.outcome == 'success'
+        continue-on-error: true
         env:
           TRANSCRIBE_CMAKE_ARGS: -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
-        run: ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:assembleDebug --stacktrace
+        run: |
+          set -o pipefail
+          ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:assembleDebug --stacktrace 2>&1 | tee apk-build.log
 
-      - name: Stage standalone streaming APK
+      - name: Stage APK
+        id: stage
+        if: steps.apk.outcome == 'success'
+        continue-on-error: true
         run: |
           mkdir -p dist
           APK=$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -print -quit)
           test -n "$APK"
           cp "$APK" dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk
-          sha256sum dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk > dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk.sha256
+          sha256sum dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk \
+            | tee dist/Offline-Voice-Input-Unified-Streaming-final-fix.apk.sha256
 
-      - name: Upload standalone streaming APK
+      - name: Upload APK artifact
+        id: upload
+        if: steps.stage.outcome == 'success'
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: offline-voice-input-unified-streaming-final-fix
@@ -272,3 +148,34 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Record build result
+        if: always()
+        run: |
+          mkdir -p build_status
+          {
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "source_sha=$(git rev-parse HEAD)"
+            echo "native_outcome=${{ steps.native.outcome }}"
+            echo "configure_outcome=${{ steps.configure.outcome }}"
+            echo "apk_outcome=${{ steps.apk.outcome }}"
+            echo "stage_outcome=${{ steps.stage.outcome }}"
+            echo "upload_outcome=${{ steps.upload.outcome }}"
+            echo "artifact=offline-voice-input-unified-streaming-final-fix"
+            echo "apk=Offline-Voice-Input-Unified-Streaming-final-fix.apk"
+          } > build_status/streaming-ime-result.txt
+          {
+            echo "===== native build tail ====="
+            tail -n 160 native-build.log 2>/dev/null || true
+            echo "===== APK build tail ====="
+            tail -n 160 apk-build.log 2>/dev/null || true
+          } > build_status/streaming-ime-build-tail.log
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build_status/streaming-ime-result.txt build_status/streaming-ime-build-tail.log
+          git commit -m "Record streaming IME build $GITHUB_RUN_ID" || exit 0
+          git push origin HEAD:feature/parakeet-unified-streaming
+
+      - name: Fail if APK was not uploaded
+        if: steps.native.outcome != 'success' || steps.configure.outcome != 'success' || steps.apk.outcome != 'success' || steps.stage.outcome != 'success' || steps.upload.outcome != 'success'
+        run: exit 1
