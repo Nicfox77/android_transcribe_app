@@ -277,7 +277,16 @@ impl Engine {
                     match stream.finalize() {
                         Ok(update) => {
                             let finalize_elapsed = finalize_started.elapsed();
-                            let text = stream.text().full;
+                            let snapshot = stream.text();
+                            let text = if !snapshot.full.trim().is_empty() {
+                                snapshot.full.clone()
+                            } else if !snapshot.committed.trim().is_empty()
+                                || !snapshot.tentative.trim().is_empty()
+                            {
+                                format!("{}{}", snapshot.committed, snapshot.tentative)
+                            } else {
+                                String::new()
+                            };
                             let audio_secs = fallback_audio.len() as f64 / 16_000.0;
                             let compute_secs = compute.as_secs_f64();
                             let rtf = if audio_secs > 0.0 {
@@ -286,14 +295,24 @@ impl Engine {
                                 0.0
                             };
                             log::info!(
-                                "buffered streaming: {:.1}s audio, feed compute {:.2}s (RTF {:.2}), finalize {:.2}s, wall {:.2}s, buffered {}ms",
+                                "buffered streaming: {:.1}s audio, feed compute {:.2}s (RTF {:.2}), finalize {:.2}s, wall {:.2}s, buffered {}ms, full={} chars, committed={} chars, tentative={} chars",
                                 audio_secs,
                                 compute_secs,
                                 rtf,
                                 finalize_elapsed.as_secs_f64(),
                                 started.elapsed().as_secs_f64(),
-                                update.buffered_ms
+                                update.buffered_ms,
+                                snapshot.full.len(),
+                                snapshot.committed.len(),
+                                snapshot.tentative.len()
                             );
+                            if text.trim().is_empty() && !fallback_audio.is_empty() {
+                                log::warn!(
+                                    "buffered stream finalized empty; retrying retained PCM in batch mode"
+                                );
+                                drop(stream);
+                                return self.transcribe(fallback_audio).map(Some);
+                            }
                             return Ok(Some(text));
                         }
                         Err(e) => {
